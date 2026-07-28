@@ -47,7 +47,7 @@ To the fullest extent permitted by law, the Bot Operator is not liable for any i
 
 ## 8. Data and privacy
 
-Our data practices are described in the [Privacy Policy](), which is incorporated into these Terms by reference.
+Our data practices are described in the [Privacy Policy](https://thebrokenvirus.github.io/UGG-Tracker/Privacy%20Policy.html), which is incorporated into these Terms by reference.
 
 ## 9. Termination
 
@@ -64,5 +64,3 @@ Questions about these Terms can be sent to:
 **kelentmcdonald@gmail.com**
 
 ---
-
-*This document is a template reflecting UGG Tracker's actual functionality as of the date above. It is not a substitute for legal advice — have it reviewed by a qualified professional before relying on it, particularly if you plan to monetize the Bot or operate it at larger scale.*
