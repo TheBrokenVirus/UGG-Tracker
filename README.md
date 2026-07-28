@@ -1,7 +1,3 @@
-
-[Privacy Policy](Privacy Policy.md)
-[Terms of Service](Terms of Service.md)
-
 # Roblox XP Tracker (Discord Bot)
 
 Tracks player XP manually via slash commands, since the bot has no direct
@@ -83,6 +79,10 @@ weekly requirement (default: 20,000 XP/week).
 | `/listxproles` | Everyone | Show all configured XP milestone roles and their thresholds. |
 | `/syncxproles` | Admin | Re-checks every tracked member's roles right now — fixes leftover role clutter without waiting for everyone's next checkin. |
 | `/progresschart [user]` | Everyone | Shows a line chart of XP over time, built from that person's checkin history. Needs at least 2 checkins. |
+| `/profile [user]` | Everyone | Shows a rendered profile card: avatar, colored border, Crew XP, rank, this week's gain, and a progress bar. See below. |
+| `/setbordercolor user: color: [custom_hex]` | Admin | Assign a profile border color — a preset from the palette, or an exact hex code. See below. |
+| `/removebordercolor user:<@user>` | Admin | Reset a user's border color to the default. |
+| `/listbordercolors` | Everyone | Show all available preset border colors. |
 | `/exportdata [file_format]` | Admin | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
 | `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
@@ -117,7 +117,7 @@ Running `/settings` opens an interactive panel (admins only) instead of typing o
 
 **Home screen:**
 - **Category dropdown** — jump into any of the five categories below
-- **Manage a User** — shows a dropdown to pick a member, then buttons for: Set Week Progress, Set Starting XP, Reset Week, Undo Last Checkin, Full Reset, Remove User
+- **Manage a User** — shows a dropdown to pick a member, then buttons for: Set Week Progress, Set Starting XP, Set Border Color, Reset Week, Undo Last Checkin, Full Reset, Remove User
 - **Refresh** — updates the panel's numbers without re-running the command
 
 **⏱️ Requirement & Week**
@@ -285,6 +285,26 @@ Turn it off with `/clearadminlogchannel`.
 Renders a line chart of that person's XP over time, built from their stored checkin history, and posts it as an image. Needs at least 2 checkins to plot anything — with only 1, there's no trend to show yet, so the bot says so instead of generating an empty chart. Like everything else, this respects the channel restriction if one is set.
 
 Chart generation depends on the `matplotlib` package (already in `requirements.txt`). If it's somehow missing, the command explains what to install rather than crashing.
+
+## Profile cards & border colors
+
+```
+/profile user:@SomeMember
+```
+
+Renders an image card — avatar with a colored ring, name, rank, Crew XP, this week's gain, and a progress bar toward the weekly requirement — instead of a plain text embed. Rank is calculated the same way as `/totalleaderboard`: by actual total XP, so it includes each person's starting point, not just XP gained while tracked.
+
+**Border colors are a cosmetic perk, currently assigned by admins:**
+
+```
+/setbordercolor user:@SomeMember color:Gold
+```
+
+There's a curated 12-color palette (`/listbordercolors` shows all of them) — Slate is the default for anyone with no color assigned, running up through Bronze, Silver, Gold, Emerald, Sapphire, Ruby, Amethyst, Sunset, Aurora, Obsidian, and Prism. You can also skip the palette and give someone an exact hex code with `custom_hex` if you want a one-off color outside the presets.
+
+**This is set up as the foundation for a future donation-perk system** — right now, `/setbordercolor` is admin-only, so *you* decide who gets which color (e.g. manually upgrading someone after they donate outside the bot). There's no automated payment or unlock system built yet; this just gives you the assignment mechanism and the visual payoff to build on top of later. If you want to add real donation handling down the line (a payment webhook automatically calling `/setbordercolor`, tracking who's "unlocked" which tier, letting donors pick their own color from what they've unlocked, etc.), that's a natural next step from here — just say the word when you're ready for it.
+
+Card rendering depends on the `Pillow` package (already in `requirements.txt`). If it's somehow missing, the command explains what to install rather than crashing. Font rendering automatically adapts to whatever's available on the host — it checks common Linux, Windows, and macOS font locations and falls back to a built-in font if none are found, so the card looks right on your Windows PC during testing and on whatever you eventually host it on.
 
 ## Public milestone announcements
 

@@ -1,4 +1,4 @@
-# Privacy Policy — UGG Tracker (Discord Bot)
+# Privacy Policy — Ultimate Gym Game Tracker (Discord Bot)
 
 **Effective date:** 7/28/26
 **Last updated:** 7/28/26

@@ -42,6 +42,11 @@ try:
 except ImportError:
     plt = None
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+
 DATA_FILE = Path(__file__).parent / "xp_data.json"
 DEFAULT_WEEKLY_REQUIREMENT = 20000
 MAX_CHECKINS_STORED = 50  # per user, to keep the file from growing forever
@@ -847,6 +852,143 @@ def build_progress_chart(entry: dict, display_name: str) -> Optional[io.BytesIO]
     buf.seek(0)
     return buf
 
+PRESET_BORDER_COLORS = {
+    "Slate": "#5C6370",     # default — no perk assigned
+    "Bronze": "#CD7F32",
+    "Silver": "#C0C0C0",
+    "Gold": "#FFD700",
+    "Emerald": "#2ECC71",
+    "Sapphire": "#3498DB",
+    "Ruby": "#E74C3C",
+    "Amethyst": "#9B59B6",
+    "Sunset": "#FF7F50",
+    "Aurora": "#00D9C6",
+    "Obsidian": "#2C2C2E",
+    "Prism": "#FF3EA5",
+}
+DEFAULT_BORDER_COLOR = PRESET_BORDER_COLORS["Slate"]
+
+_PROFILE_FONT_CANDIDATES_BOLD = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "C:\\Windows\\Fonts\\arialbd.ttf",
+    "C:\\Windows\\Fonts\\segoeuib.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+]
+_PROFILE_FONT_CANDIDATES_REGULAR = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+]
+
+def _find_profile_font(bold: bool, size: int):
+    """Tries common font paths across Linux (Railway/most hosts), Windows,
+    and macOS, falling back to Pillow's built-in font if none are found —
+    modern Pillow (10.1+) supports a size argument even on the fallback,
+    so this never looks broken, just plainer."""
+    candidates = _PROFILE_FONT_CANDIDATES_BOLD if bold else _PROFILE_FONT_CANDIDATES_REGULAR
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except (OSError, IOError):
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()  # very old Pillow without size support
+
+def _hex_to_rgb(hex_str: str) -> tuple:
+    hex_str = hex_str.lstrip("#")
+    return tuple(int(hex_str[i:i + 2], 16) for i in (0, 2, 4))
+
+def get_border_color(entry: dict) -> str:
+    """Backward-compatible getter — entries created before this feature
+    won't have a border_color key."""
+    return entry.get("border_color", DEFAULT_BORDER_COLOR)
+
+async def build_profile_card(
+    member: discord.abc.User, entry: dict, stats: dict, requirement: int, rank: int, total_members: int,
+) -> Optional[io.BytesIO]:
+    """Renders a profile card PNG: avatar with a colored ring, name, rank,
+    Crew XP, this week's gain, and a weekly-progress bar — all in the
+    member's assigned border color. Returns None if Pillow isn't installed."""
+    if Image is None:
+        return None
+
+    CARD_W, CARD_H = 900, 300
+    BG_COLOR = (35, 39, 42, 255)
+    MUTED_TEXT = (170, 175, 182, 255)
+    WHITE = (245, 246, 248, 255)
+    BAR_BG = (58, 61, 66, 255)
+    ON_TRACK_GREEN = (99, 209, 129, 255)
+    BEHIND_ORANGE = (240, 170, 80, 255)
+
+    border_hex = get_border_color(entry)
+    border_rgb = _hex_to_rgb(border_hex) + (255,)
+
+    # Fetch avatar bytes directly through discord.py's Asset — no extra HTTP client needed
+    try:
+        avatar_bytes = await member.display_avatar.replace(size=256, format="png").read()
+        avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+    except (discord.HTTPException, discord.NotFound):
+        avatar_img = Image.new("RGBA", (256, 256), (88, 101, 242, 255))
+
+    card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
+
+    draw.rounded_rectangle([0, 0, CARD_W - 1, CARD_H - 1], radius=24, fill=BG_COLOR)
+    draw.rounded_rectangle([4, 4, CARD_W - 5, CARD_H - 5], radius=22, outline=border_rgb, width=8)
+
+    avatar_size = 200
+    avatar_pos = (35, (CARD_H - avatar_size) // 2)
+    avatar_img = avatar_img.resize((avatar_size, avatar_size))
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
+    ring_pad = 6
+    draw.ellipse(
+        [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
+         avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
+        outline=border_rgb, width=5,
+    )
+    card.paste(avatar_img, avatar_pos, mask)
+
+    text_x = 35 + avatar_size + 45
+    font_name = _find_profile_font(True, 42)
+    font_rank = _find_profile_font(True, 22)
+    font_stat_label = _find_profile_font(False, 18)
+    font_stat_value = _find_profile_font(True, 26)
+    font_bar_label = _find_profile_font(False, 14)
+
+    display_name = member.display_name
+    if len(display_name) > 20:
+        display_name = display_name[:19] + "…"
+    draw.text((text_x, 42), display_name, font=font_name, fill=WHITE)
+    draw.text((text_x, 100), f"Rank #{rank} of {total_members}", font=font_rank, fill=border_rgb)
+
+    stat_y = 150
+    draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
+    draw.text((text_x, stat_y + 24), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
+
+    stat_x2 = text_x + 280
+    draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
+    week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
+    draw.text((stat_x2, stat_y + 24), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+
+    bar_x, bar_y = text_x, 230
+    bar_w, bar_h = CARD_W - text_x - 40, 22
+    effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
+    pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
+    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=11, fill=BAR_BG)
+    if pct > 0:
+        fill_w = max(int(bar_w * pct), bar_h)
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=11, fill=border_rgb)
+    draw.text((bar_x, bar_y - 20), f"Weekly progress — {pct * 100:.0f}%", font=font_bar_label, fill=MUTED_TEXT)
+
+    buf = io.BytesIO()
+    card.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
 # ---------------------------------------------------------------------------
 # Interactive settings panel (buttons, modals, select menus)
 # ---------------------------------------------------------------------------
@@ -1438,6 +1580,76 @@ class ConfirmRestoreView(discord.ui.View):
                 pass
 
 
+class CustomBorderColorModal(discord.ui.Modal, title="Custom Border Color"):
+    hex_code = discord.ui.TextInput(label="Hex code (e.g. FF5733)", placeholder="FF5733", max_length=7)
+
+    def __init__(self, guild_id: int, member: discord.Member):
+        super().__init__()
+        self.guild_id = guild_id
+        self.member = member
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cleaned = self.hex_code.value.strip().lstrip("#")
+        if len(cleaned) != 6 or any(c not in "0123456789abcdefABCDEF" for c in cleaned):
+            await interaction.response.send_message("Invalid hex code — use a format like FF5733.", ephemeral=True)
+            return
+        hex_value = f"#{cleaned.upper()}"
+
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        entry = guild_data["users"].get(str(self.member.id))
+        if entry is None:
+            await interaction.response.send_message("That user has no tracking data.", ephemeral=True)
+            return
+        entry["border_color"] = hex_value
+        save_data(data)
+        await log_admin_action(
+            interaction.guild, guild_data, interaction.user, "Set profile border color",
+            target=self.member.mention, details=f"Color: {hex_value}",
+        )
+        await interaction.response.send_message(
+            f"{self.member.mention}'s profile border color is now **{hex_value}**.", ephemeral=True
+        )
+
+
+class BorderColorSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, member: discord.Member):
+        self.guild_id = guild_id
+        self.member = member
+        options = [
+            discord.SelectOption(label=name, value=hex_val, description=hex_val)
+            for name, hex_val in PRESET_BORDER_COLORS.items()
+        ]
+        options.append(discord.SelectOption(label="Custom hex code...", value="custom", emoji="✏️"))
+        super().__init__(placeholder="Choose a border color...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        if value == "custom":
+            await interaction.response.send_modal(CustomBorderColorModal(self.guild_id, self.member))
+            return
+
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        entry = guild_data["users"].get(str(self.member.id))
+        if entry is None:
+            await interaction.response.send_message("That user has no tracking data.", ephemeral=True)
+            return
+        entry["border_color"] = value
+        save_data(data)
+        await log_admin_action(
+            interaction.guild, guild_data, interaction.user, "Set profile border color",
+            target=self.member.mention, details=f"Color: {value}",
+        )
+        await interaction.response.send_message(f"{self.member.mention}'s profile border color is now **{value}**.", ephemeral=True)
+
+
+class BorderColorSelectView(discord.ui.View):
+    def __init__(self, guild_id: int, member: discord.Member):
+        super().__init__(timeout=120)
+        self.add_item(BorderColorSelect(guild_id, member))
+
+
 class UserActionView(discord.ui.View):
     """Shown after picking a user from UserSelectView — one-click actions for that user."""
 
@@ -1453,6 +1665,11 @@ class UserActionView(discord.ui.View):
     @discord.ui.button(label="Set Starting XP", style=discord.ButtonStyle.primary, emoji="🏁")
     async def set_baseline(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(UserBaselineModal(self.guild_id, self.member))
+
+    @discord.ui.button(label="Set Border Color", style=discord.ButtonStyle.primary, emoji="🎨")
+    async def set_border_color(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = BorderColorSelectView(self.guild_id, self.member)
+        await interaction.response.send_message("Select a border color:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Reset Week", style=discord.ButtonStyle.secondary, emoji="🔁")
     async def reset_week(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2476,6 +2693,45 @@ async def progresschart(interaction: discord.Interaction, user: Optional[discord
     await interaction.followup.send(embed=embed, file=file)
 
 
+@bot.tree.command(name="profile", description="Show a profile card with your (or someone else's) Crew XP, rank, and border color")
+@app_commands.describe(user="User to show (defaults to you)")
+@require_tracking_channel()
+async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(target.id))
+
+    if entry is None:
+        await interaction.response.send_message(
+            f"{target.display_name} hasn't checked in yet — no profile to show. Use `/checkin` to start tracking.",
+            ephemeral=True,
+        )
+        return
+
+    if Image is None:
+        await interaction.response.send_message(
+            "Profile cards require the `Pillow` package, which isn't installed. "
+            "Run `pip install Pillow` and restart the bot.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # Rank by actual total XP, same ordering as /totalleaderboard
+    ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
+    rank = next((i + 1 for i, (uid, _) in enumerate(ranked) if uid == str(target.id)), len(ranked))
+    total_members = len(ranked)
+
+    stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+    save_data(data)  # persist any lazy rollover triggered by compute_stats
+
+    card_buf = await build_profile_card(target, entry, stats, guild_data["requirement"], rank, total_members)
+    file = discord.File(fp=card_buf, filename="profile.png")
+    await interaction.followup.send(file=file)
+
+
 @bot.tree.command(name="undo", description="Remove the most recent checkin (yours, or someone else's if you're an admin)")
 @app_commands.describe(user="Whose checkin to undo — defaults to you. Undoing someone else requires Manage Server.")
 @require_tracking_channel()
@@ -3334,6 +3590,86 @@ async def syncxproles(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="setbordercolor", description="[Admin] Assign a profile border color to a user")
+@app_commands.describe(
+    user="User to assign a border color to",
+    color="Choose a preset color",
+    custom_hex="Or specify an exact hex code (e.g. #FF5733) instead of a preset — overrides the preset if given",
+)
+@app_commands.choices(color=[
+    app_commands.Choice(name=f"{name} ({hex_val})", value=hex_val)
+    for name, hex_val in PRESET_BORDER_COLORS.items()
+])
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setbordercolor(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    color: Optional[app_commands.Choice[str]] = None,
+    custom_hex: Optional[str] = None,
+):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(user.id))
+
+    if entry is None:
+        await interaction.response.send_message(
+            "That user has no tracking data yet — have them run `/checkin` first.", ephemeral=True
+        )
+        return
+
+    if custom_hex:
+        cleaned = custom_hex.strip().lstrip("#")
+        if len(cleaned) != 6 or any(c not in "0123456789abcdefABCDEF" for c in cleaned):
+            await interaction.response.send_message(
+                "That doesn't look like a valid hex color — use a format like `#FF5733` or `FF5733`.",
+                ephemeral=True,
+            )
+            return
+        hex_value = f"#{cleaned.upper()}"
+    elif color:
+        hex_value = color.value
+    else:
+        await interaction.response.send_message("Pick a preset `color` or provide a `custom_hex`.", ephemeral=True)
+        return
+
+    entry["border_color"] = hex_value
+    save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Set profile border color",
+        target=user.mention, details=f"Color: {hex_value}",
+    )
+    await interaction.response.send_message(f"{user.mention}'s profile border color is now **{hex_value}**.")
+
+
+@bot.tree.command(name="removebordercolor", description="[Admin] Reset a user's profile border color to the default")
+@app_commands.describe(user="User to reset")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def removebordercolor(interaction: discord.Interaction, user: discord.Member):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(user.id))
+
+    if entry is None:
+        await interaction.response.send_message("That user has no tracking data.", ephemeral=True)
+        return
+
+    entry.pop("border_color", None)
+    save_data(data)
+    await interaction.response.send_message(f"{user.mention}'s profile border color reset to the default.")
+
+
+@bot.tree.command(name="listbordercolors", description="Show all available profile border colors")
+async def listbordercolors(interaction: discord.Interaction):
+    lines = [f"**{name}** — `{hex_val}`" for name, hex_val in PRESET_BORDER_COLORS.items()]
+    embed = discord.Embed(
+        title="🎨 Profile Border Colors",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Slate is the default. Admins assign colors with /setbordercolor.")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(
     name="setbaseline",
     description="[Admin] Set or correct a user's all-time starting XP (used for the total leaderboard)",
@@ -3643,6 +3979,8 @@ syncxproles.error(_perm_error)
 importxp.error(_perm_error)
 settings_cmd.error(_perm_error)
 setbaseline.error(_perm_error)
+setbordercolor.error(_perm_error)
+removebordercolor.error(_perm_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
 setweekprogress.error(_perm_error)
@@ -3657,6 +3995,7 @@ weeklyleaderboard.error(_channel_error)
 totalleaderboard.error(_channel_error)
 history.error(_channel_error)
 progresschart.error(_channel_error)
+profile_cmd.error(_channel_error)
 crewtotals.error(_channel_error)
 undo.error(_channel_error)
 removeallusers.error(_perm_error)

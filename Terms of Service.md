@@ -1,4 +1,4 @@
-# Terms of Service — UGG Tracker (Discord Bot)
+# Terms of Service — Ultimate Gym Game Tracker (Discord Bot)
 
 **Effective date:** 7/28/26
 **Last updated:** 7/28/26
