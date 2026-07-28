@@ -121,6 +121,7 @@ def get_guild(data: dict, guild_id: int) -> dict:
             "inactivity_channel_id": None,
             "inactivity_threshold_hours": DEFAULT_INACTIVITY_THRESHOLD_HOURS,
             "last_inactivity_ping_marker": None,
+            "inactivity_include_behind_pace": False,
             "leaderboard_pagination": False,
         }
     return data["guilds"][gid]
@@ -128,6 +129,10 @@ def get_guild(data: dict, guild_id: int) -> dict:
 def get_restricted_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
     return guild_data.get("restricted_channel_id")
+
+def inactivity_includes_behind_pace(guild_data: dict) -> bool:
+    """Backward-compatible getter — older guild entries won't have this key."""
+    return guild_data.get("inactivity_include_behind_pace", False)
 
 def get_announce_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
@@ -734,7 +739,8 @@ def build_settings_embed(guild_data: dict) -> discord.Embed:
     )
     inactivity_ch = get_inactivity_channel_id(guild_data)
     if inactivity_ch:
-        inactivity_val = f"<#{inactivity_ch}> ({format_duration(get_inactivity_threshold_hours(guild_data))} before end)"
+        scope = "+ behind pace" if inactivity_includes_behind_pace(guild_data) else "zero checkins only"
+        inactivity_val = f"<#{inactivity_ch}> ({format_duration(get_inactivity_threshold_hours(guild_data))} before end, {scope})"
     else:
         inactivity_val = "Off"
     embed.add_field(name="Inactivity Pings", value=inactivity_val, inline=True)
@@ -1646,29 +1652,37 @@ async def scheduled_checks():
         inactivity_channel_id = get_inactivity_channel_id(guild_data)
         if inactivity_channel_id:
             threshold = timedelta(hours=get_inactivity_threshold_hours(guild_data))
+            include_behind_pace = inactivity_includes_behind_pace(guild_data)
             if (
                 timedelta(0) < time_until_end <= threshold
                 and guild_data.get("last_inactivity_ping_marker") != week_marker
             ):
-                inactive_members = []
+                no_checkin_members = []
+                behind_pace_members = []
                 for uid, entry in guild_data["users"].items():
                     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+                    member = guild.get_member(int(uid))
+                    if not member:
+                        continue
                     if stats["checkins_this_week"] == 0:
-                        member = guild.get_member(int(uid))
-                        if member:
-                            inactive_members.append(member)
+                        no_checkin_members.append(member)
+                    elif include_behind_pace and not stats["on_track"]:
+                        behind_pace_members.append(member)
 
-                if inactive_members:
+                if no_checkin_members or behind_pace_members:
                     channel = guild.get_channel(inactivity_channel_id)
                     if channel:
-                        mentions = " ".join(m.mention for m in inactive_members)
                         time_left_str = format_duration(time_until_end.total_seconds() / 3600)
+                        parts = [f"⏰ **Inactivity reminder** — the week ends in **{time_left_str}**."]
+                        if no_checkin_members:
+                            mentions = " ".join(m.mention for m in no_checkin_members)
+                            parts.append(f"\n**Haven't checked in at all this week:**\n{mentions}")
+                        if behind_pace_members:
+                            mentions = " ".join(m.mention for m in behind_pace_members)
+                            parts.append(f"\n**Checked in, but behind pace to hit the requirement:**\n{mentions}")
+                        parts.append("\nRun `/checkin` before the week ends!")
                         try:
-                            await channel.send(
-                                f"⏰ **Inactivity reminder** — the week ends in **{time_left_str}** and these "
-                                f"members haven't checked in yet this week:\n{mentions}\n\n"
-                                f"Run `/checkin` before the week ends!"
-                            )
+                            await channel.send("\n".join(parts))
                         except discord.HTTPException:
                             pass
                 guild_data["last_inactivity_ping_marker"] = week_marker
@@ -2340,6 +2354,27 @@ async def setinactivitythreshold(interaction: discord.Interaction, days: int = 0
     await interaction.response.send_message(
         f"Inactivity pings will now fire when **{format_duration(threshold_hours)}** remain before the week ends."
     )
+
+
+@bot.tree.command(
+    name="toggleinactivitybehindpace",
+    description="[Admin] Also ping people who checked in but are behind pace, not just zero-checkin people",
+)
+@app_commands.describe(enabled="True to also include behind-pace members, false for zero-checkins only (default)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def toggleinactivitybehindpace(interaction: discord.Interaction, enabled: bool):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["inactivity_include_behind_pace"] = enabled
+    save_data(data)
+    if enabled:
+        msg = (
+            "Inactivity pings will now include **two groups**: people with zero checkins this week, "
+            "and people who've checked in but are behind pace to hit the requirement."
+        )
+    else:
+        msg = "Inactivity pings will only include people with **zero checkins** this week (default)."
+    await interaction.response.send_message(msg)
 
 
 @bot.tree.command(name="toggleleaderboardpagination", description="[Admin] Use Previous/Next buttons instead of truncating long leaderboards")
@@ -3065,6 +3100,7 @@ clearweeklypost.error(_perm_error)
 setinactivitychannel.error(_perm_error)
 clearinactivitychannel.error(_perm_error)
 setinactivitythreshold.error(_perm_error)
+toggleinactivitybehindpace.error(_perm_error)
 toggleleaderboardpagination.error(_perm_error)
 exportdata.error(_perm_error)
 undoimport.error(_perm_error)

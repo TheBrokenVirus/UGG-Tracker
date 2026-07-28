@@ -88,6 +88,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/setinactivitychannel channel:<#channel>` | Admin | Ping anyone with zero checkins as the week nears its end. Requires a shared server week. |
 | `/clearinactivitychannel` | Admin | Turn off inactivity reminder pings. |
 | `/setinactivitythreshold days: hours: minutes:` | Admin | How long before week-end the inactivity ping fires (default: 24 hours). |
+| `/toggleinactivitybehindpace enabled:<true/false>` | Admin | Whether inactivity pings also include people who checked in but are behind pace, not just people with zero checkins (default: off — zero checkins only). |
 | `/toggleleaderboardpagination enabled:<true/false>` | Admin | Switch leaderboards between Previous/Next paging and the default single truncated embed. |
 | `/setbaseline user:<@user> starting_xp:<number>` | Admin | Set or correct someone's all-time starting XP — this is what `/totalleaderboard` calculates total gain from. |
 | `/importxp file:<.csv or .xlsx> [existing_users] [announce_milestones]` | Admin | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. `announce_milestones` (default: no) controls whether XP role milestones hit during this import get posted publicly. See below. |
@@ -259,9 +260,17 @@ Auto-posts the weekly leaderboard to that channel once, shortly before each week
 /setinactivitythreshold days:0 hours:24 minutes:0
 ```
 
-As the week nears its end, the bot @mentions anyone tracked who has **zero checkins so far that week** in the channel you set, once — not repeatedly. `/setinactivitythreshold` controls how early this fires (default: 24 hours before week-end); set it earlier for a bigger heads-up, or closer to the deadline for a final-hours nudge. Like the scheduled post, this also **requires a shared server week**.
+As the week nears its end, the bot @mentions relevant members in the channel you set, once — not repeatedly. `/setinactivitythreshold` controls how early this fires (default: 24 hours before week-end); set it earlier for a bigger heads-up, or closer to the deadline for a final-hours nudge. Like the scheduled post, this also **requires a shared server week**.
 
-Run `/clearinactivitychannel` to turn pings off.
+**By default, this only catches people with zero checkins that week** — it doesn't look at pace at all. Someone who checked in once but is way behind on XP gets no ping by default, same as someone who's comfortably on track. To also flag people who *have* checked in but are behind pace to hit the requirement:
+
+```
+/toggleinactivitybehindpace enabled:true
+```
+
+With this on, the ping message splits into two clearly labeled groups — "haven't checked in at all" and "checked in, but behind pace" — so it's obvious which situation each person is in rather than lumping everyone into one undifferentiated list.
+
+Run `/clearinactivitychannel` to turn pings off entirely.
 
 ## Leaderboard pagination
 
