@@ -1637,6 +1637,47 @@ async def before_scheduled_checks():
     await bot.wait_until_ready()
 
 
+PRESENCE_ROTATION_SECONDS = 45
+_presence_index = 0
+
+
+def build_presence_statuses() -> list:
+    """Builds the rotation of (ActivityType, text) pairs shown under the
+    bot's name. Recomputed each rotation so counts stay current — cheap
+    since it's just reading the already-loaded data file, not hitting
+    Discord's API. A bot can only show simple text next to an activity
+    verb (Playing/Watching/Listening/Competing) — the image+buttons style
+    of Rich Presence is a feature for user game clients, not available to
+    bots via the API."""
+    data = load_data()
+    total_tracked = sum(len(get_guild(data, g.id)["users"]) for g in bot.guilds)
+    return [
+        (discord.ActivityType.watching, f"{total_tracked} XP trackers"),
+        (discord.ActivityType.listening, "/checkin"),
+        (discord.ActivityType.playing, f"{len(bot.guilds)} servers"),
+        (discord.ActivityType.watching, "/settings for admin tools"),
+    ]
+
+
+@tasks.loop(seconds=PRESENCE_ROTATION_SECONDS)
+async def rotate_presence():
+    global _presence_index
+    statuses = build_presence_statuses()
+    if not statuses:
+        return
+    activity_type, text = statuses[_presence_index % len(statuses)]
+    _presence_index += 1
+    try:
+        await bot.change_presence(activity=discord.Activity(type=activity_type, name=text))
+    except discord.HTTPException:
+        pass
+
+
+@rotate_presence.before_loop
+async def before_rotate_presence():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     try:
@@ -1652,6 +1693,8 @@ async def on_ready():
 
     if not scheduled_checks.is_running():
         scheduled_checks.start()
+    if not rotate_presence.is_running():
+        rotate_presence.start()
 
 
 # ---------------------------------------------------------------------------

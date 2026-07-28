@@ -262,6 +262,14 @@ By default, a leaderboard that's too long to fit in one Discord embed gets trunc
 
 Switches `/weeklyleaderboard` and `/totalleaderboard` (and the scheduled auto-post) to Previous/Next buttons instead, paging through 10 entries at a time so nobody gets cut off the list. Turn it back off with `enabled:false` to return to the single-embed view.
 
+## Bot status (presence)
+
+The bot's Discord status automatically rotates every 45 seconds between a few useful lines shown under its name — "Watching 12 XP trackers," "Listening to /checkin," "Watching 3 servers," and a pointer to `/settings`. This needs no setup and isn't configurable per-server since a bot only has one global status across every server it's in.
+
+Worth knowing: this is the extent of what a Discord *bot* can do here. True Rich Presence — the image, buttons, and party info you see on some Discord user profiles for games — is a feature of Discord's RPC SDK for user game clients, not something available to bots through the bot API. A bot's status is limited to one activity verb (Playing/Watching/Listening/Competing) plus a short text line, which is what's implemented here.
+
+To customize the rotation text, edit the list inside `build_presence_statuses()` near the top of `bot.py`.
+
 ## Notes & limitations
 
 - **Scheduled posts and pings need the bot online at the right moment**:
