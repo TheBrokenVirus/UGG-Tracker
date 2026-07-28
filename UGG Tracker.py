@@ -86,6 +86,18 @@ def week_range_str(week_start_dt: datetime) -> str:
     start_ts, end_ts = int(week_start_dt.timestamp()), int(week_end_dt.timestamp())
     return f"<t:{start_ts}:D> → <t:{end_ts}:D>"
 
+def build_progress_bar(current: float, target: float, length: int = 14) -> str:
+    """Renders a simple text progress bar using block characters, e.g.
+    '████████░░░░░░ 57%'. Clamps at 100% even if current exceeds target
+    (finishing early shouldn't render a broken/overflowing bar)."""
+    if target <= 0:
+        pct = 1.0 if current > 0 else 0.0
+    else:
+        pct = max(min(current / target, 1.0), 0.0)
+    filled = round(pct * length)
+    bar = "█" * filled + "░" * (length - filled)
+    return f"{bar} {pct * 100:.0f}%"
+
 # ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
@@ -630,6 +642,10 @@ def build_status_embed(member: discord.abc.User, entry: dict, stats: dict, requi
     color = discord.Color.green() if stats["on_track"] else discord.Color.orange()
     embed = discord.Embed(title=f"\U0001F4C8 XP Status \u2014 {member.display_name}", color=color)
     embed.add_field(name="📅 Week Runs", value=week_range_str(parse_iso(entry["week_start_time"])), inline=False)
+
+    progress_target = stats["effective_requirement"] if stats["is_prorated"] else requirement
+    bar = build_progress_bar(stats["gained_this_week"], progress_target)
+    embed.add_field(name="Progress Toward Requirement", value=bar, inline=False)
 
     embed.add_field(name="Current XP", value=f"{entry['current_xp']:,}", inline=True)
     embed.add_field(name="Gained This Week", value=f"{stats['gained_this_week']:,}", inline=True)
@@ -1403,9 +1419,165 @@ class UserSelectView(discord.ui.View):
         )
 
 
-class SettingsView(discord.ui.View):
-    def __init__(self, guild_id: int, show_recent_rate: bool = True, compact_leaderboard: bool = False,
-                 leaderboard_pagination: bool = False):
+HELP_CATEGORIES = [
+    ("tracking", "Tracking", "📝", "Checking in and viewing progress", [
+        ("/checkin xp:<number> [user]", "Record current XP — yours, or (admin) someone else's"),
+        ("/status [user]", "Weekly progress, rate, and projection for yourself or another user"),
+        ("/undo [user]", "Remove the most recent checkin"),
+        ("/history [user]", "Last 10 checkins for a user"),
+        ("/progresschart [user]", "XP-over-time line chart for a user"),
+    ]),
+    ("leaderboards", "Leaderboards", "🏆", "Comparing progress across the crew", [
+        ("/weeklyleaderboard", "This week's XP ranking"),
+        ("/totalleaderboard", "All-time total XP ranking (includes starting point)"),
+        ("/crewtotals", "Combined crew-wide totals, including departed members"),
+        ("/listxproles", "Show configured XP milestone roles"),
+    ]),
+    ("admin_core", "Admin: Requirement & Week", "⏱️", "Weekly goal, week sync, proration", [
+        ("/settings", "Open the interactive settings panel"),
+        ("/setrequirement xp:<number>", "Change the weekly XP goal"),
+        ("/setweekprogress user: days: hours: minutes:", "Backdate one user's week progress"),
+        ("/setweekprogressall days: hours: minutes:", "Backdate everyone's week progress at once"),
+        ("/resetweek user:<@user>", "Restart one user's weekly window right now"),
+        ("/setproratethreshold days: hours: minutes:", "How late is \"late enough\" to prorate a first week"),
+    ]),
+    ("admin_users", "Admin: Users & Data", "👤", "Correcting, resetting, importing, exporting", [
+        ("/setbaseline user: starting_xp:", "Set/correct someone's all-time starting XP"),
+        ("/fullreset user: [clear_history]", "Reset both weekly and all-time totals for one user"),
+        ("/removeuser user:<@user>", "Wipe one user's tracking data"),
+        ("/removeuserbyid discord_id:<id>", "Same, but by raw ID — works for departed members"),
+        ("/removeallusers", "Wipe everyone's tracking data (confirmation required)"),
+        ("/removestaleusers", "Bulk-remove everyone no longer in the server"),
+        ("/importxp file: [existing_users] [announce_milestones]", "Bulk-set XP from a CSV/Excel file"),
+        ("/exportdata [file_format]", "Download everyone's stats as CSV/Excel"),
+        ("/undoimport", "Revert the entire last import in one action"),
+    ]),
+    ("admin_roles", "Admin: XP Roles", "🏅", "Auto-assigning roles at XP milestones", [
+        ("/addxprole xp: role: [exclusive]", "Auto-assign a role at an XP threshold"),
+        ("/removexprole role:<@role>", "Stop auto-assigning a role"),
+        ("/syncxproles", "Re-check everyone's roles right now"),
+    ]),
+    ("admin_display", "Admin: Display", "🎨", "How leaderboards and status look", [
+        ("/togglerecentrate enabled:", "Show/hide the \"Recent Rate\" field"),
+        ("/togglecompactleaderboard enabled:", "Short vs. full-detail leaderboard entries"),
+        ("/toggleleaderboardpagination enabled:", "Previous/Next paging vs. a single truncated embed"),
+    ]),
+    ("admin_automation", "Admin: Channels & Automation", "📢", "Restrictions, announcements, schedules, pings", [
+        ("/setchannel channel: / /clearchannel", "Restrict tracking commands to one channel"),
+        ("/setannouncechannel channel: / /clearannouncechannel", "Public posts when someone earns a role"),
+        ("/setweeklypost channel: / /clearweeklypost", "Auto-post the leaderboard before each week ends"),
+        ("/setinactivitychannel channel: / /clearinactivitychannel", "Ping people who haven't checked in"),
+        ("/setinactivitythreshold days: hours: minutes:", "How early the inactivity ping fires"),
+        ("/toggleinactivitybehindpace enabled:", "Also flag people behind pace, not just zero-checkins"),
+    ]),
+]
+
+
+def build_help_overview_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="📖 XP Tracker — Help",
+        description=(
+            "This bot tracks Roblox XP manually, since it can't read the game directly — "
+            "everyone self-reports with `/checkin`.\n\nUse the dropdown below to browse commands by category."
+        ),
+        color=discord.Color.blurple(),
+    )
+    for value, label, emoji, desc, commands in HELP_CATEGORIES:
+        embed.add_field(name=f"{emoji} {label}", value=desc, inline=True)
+    embed.set_footer(text="Most commands work for everyone; admin-only ones need Manage Server.")
+    return embed
+
+
+def build_help_category_embed(category: str) -> discord.Embed:
+    for value, label, emoji, desc, commands in HELP_CATEGORIES:
+        if value == category:
+            lines = [f"`{cmd}`\n{d}" for cmd, d in commands]
+            embed = discord.Embed(
+                title=f"{emoji} {label}",
+                description=desc + "\n\n" + "\n\n".join(lines),
+                color=discord.Color.blurple(),
+            )
+            return embed
+    return build_help_overview_embed()
+
+
+async def go_help_home(interaction: discord.Interaction):
+    embed = build_help_overview_embed()
+    view = HelpView()
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+class HelpCategorySelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=label, value=value, emoji=emoji, description=desc)
+            for value, label, emoji, desc, commands in HELP_CATEGORIES
+        ]
+        super().__init__(placeholder="Choose a category to see its commands...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        embed = build_help_category_embed(self.values[0])
+        view = HelpCategoryView()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class HelpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(HelpCategorySelect())
+
+
+class HelpCategoryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(HelpCategorySelect())
+
+    @discord.ui.button(label="⬅ Overview", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_help_home(interaction)
+
+
+SETTINGS_CATEGORIES = [
+    ("requirement_week", "Requirement & Week", "⏱️", "Weekly XP goal, syncing everyone's week, proration"),
+    ("display", "Display", "🎨", "Recent rate, compact leaderboard, pagination"),
+    ("roles", "XP Roles", "🏅", "Milestone roles tied to XP thresholds"),
+    ("automation", "Channels & Automation", "📢", "Tracking channel, announcements, schedules, pings"),
+    ("danger", "Danger Zone", "⚠️", "Bulk-remove tracked users"),
+]
+
+
+async def go_settings_home(interaction: discord.Interaction, guild_id: int):
+    data = load_data()
+    guild_data = get_guild(data, guild_id)
+    embed = build_settings_embed(guild_data)
+    view = SettingsHomeView(guild_id)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+class RequirementWeekView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
+
+    @discord.ui.button(label="Set Requirement", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def set_requirement(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RequirementModal(self.guild_id))
+
+    @discord.ui.button(label="Sync Week (Everyone)", style=discord.ButtonStyle.primary, emoji="🕒")
+    async def sync_week(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SyncWeekModal(self.guild_id))
+
+    @discord.ui.button(label="Prorate Threshold", style=discord.ButtonStyle.primary, emoji="⏳")
+    async def set_prorate_threshold(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ProrateThresholdModal(self.guild_id))
+
+
+class DisplaySettingsView(discord.ui.View):
+    def __init__(self, guild_id: int, show_recent_rate: bool, compact_leaderboard: bool, leaderboard_pagination: bool):
         super().__init__(timeout=300)
         self.guild_id = guild_id
         self._set_recent_rate_label(show_recent_rate)
@@ -1424,17 +1596,52 @@ class SettingsView(discord.ui.View):
         self.toggle_pagination.label = "Pagination: ON" if enabled else "Pagination: OFF"
         self.toggle_pagination.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
 
-    @discord.ui.button(label="Set Requirement", style=discord.ButtonStyle.primary, emoji="✏️")
-    async def set_requirement(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RequirementModal(self.guild_id))
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
 
-    @discord.ui.button(label="Sync Week (Everyone)", style=discord.ButtonStyle.primary, emoji="🕒")
-    async def sync_week(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SyncWeekModal(self.guild_id))
+    @discord.ui.button(label="Recent Rate: ON", style=discord.ButtonStyle.success, emoji="⏱️")
+    async def toggle_recent_rate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        new_state = not show_recent_rate_enabled(guild_data)
+        guild_data["show_recent_rate"] = new_state
+        save_data(data)
+        self._set_recent_rate_label(new_state)
+        embed = build_settings_embed(guild_data)
+        await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="Prorate Threshold", style=discord.ButtonStyle.primary, emoji="⏳")
-    async def set_prorate_threshold(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ProrateThresholdModal(self.guild_id))
+    @discord.ui.button(label="Compact Leaderboard: OFF", style=discord.ButtonStyle.secondary, emoji="📏")
+    async def toggle_compact_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        new_state = not compact_leaderboard_enabled(guild_data)
+        guild_data["compact_leaderboard"] = new_state
+        save_data(data)
+        self._set_compact_label(new_state)
+        embed = build_settings_embed(guild_data)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Pagination: OFF", style=discord.ButtonStyle.secondary, emoji="📖")
+    async def toggle_pagination(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        new_state = not leaderboard_pagination_enabled(guild_data)
+        guild_data["leaderboard_pagination"] = new_state
+        save_data(data)
+        self._set_pagination_label(new_state)
+        embed = build_settings_embed(guild_data)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+class RolesSettingsView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
 
     @discord.ui.button(label="Add XP Role", style=discord.ButtonStyle.primary, emoji="🏅")
     async def add_xp_role(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1469,73 +1676,61 @@ class SettingsView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Set Tracking Channel", style=discord.ButtonStyle.primary, emoji="📌")
+
+class AutomationSettingsView(discord.ui.View):
+    def __init__(self, guild_id: int, inactivity_behind_pace: bool):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self._set_behind_pace_label(inactivity_behind_pace)
+
+    def _set_behind_pace_label(self, enabled: bool):
+        self.toggle_behind_pace.label = "Inactivity: +Behind Pace" if enabled else "Inactivity: Zero Checkins Only"
+        self.toggle_behind_pace.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary, row=0)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
+
+    @discord.ui.button(label="Tracking Channel", style=discord.ButtonStyle.primary, emoji="📌", row=0)
     async def set_tracking_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = SetTrackingChannelView(self.guild_id)
         await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Set Announce Channel", style=discord.ButtonStyle.primary, emoji="📢")
+    @discord.ui.button(label="Announce Channel", style=discord.ButtonStyle.primary, emoji="📢", row=0)
     async def set_announce_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = SetAnnounceChannelView(self.guild_id)
         await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Set Weekly Post Channel", style=discord.ButtonStyle.primary, emoji="🗓️")
+    @discord.ui.button(label="Weekly Post Channel", style=discord.ButtonStyle.primary, emoji="🗓️", row=1)
     async def set_weekly_post_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = SetWeeklyPostChannelView(self.guild_id)
         await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Set Inactivity Channel", style=discord.ButtonStyle.primary, emoji="⏰")
+    @discord.ui.button(label="Inactivity Channel", style=discord.ButtonStyle.primary, emoji="⏰", row=1)
     async def set_inactivity_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = SetInactivityChannelView(self.guild_id)
         await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Pagination: OFF", style=discord.ButtonStyle.secondary, emoji="📖")
-    async def toggle_pagination(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Inactivity: Zero Checkins Only", style=discord.ButtonStyle.secondary, emoji="🎯", row=1)
+    async def toggle_behind_pace(self, interaction: discord.Interaction, button: discord.ui.Button):
         data = load_data()
         guild_data = get_guild(data, self.guild_id)
-        new_state = not leaderboard_pagination_enabled(guild_data)
-        guild_data["leaderboard_pagination"] = new_state
+        new_state = not inactivity_includes_behind_pace(guild_data)
+        guild_data["inactivity_include_behind_pace"] = new_state
         save_data(data)
-        self._set_pagination_label(new_state)
+        self._set_behind_pace_label(new_state)
         embed = build_settings_embed(guild_data)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="Manage a User", style=discord.ButtonStyle.secondary, emoji="👤")
-    async def manage_user(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = UserSelectView(self.guild_id)
-        await interaction.response.send_message("Select a user:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Recent Rate: ON", style=discord.ButtonStyle.success, emoji="⏱️")
-    async def toggle_recent_rate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        guild_data = get_guild(data, self.guild_id)
-        new_state = not show_recent_rate_enabled(guild_data)
-        guild_data["show_recent_rate"] = new_state
-        save_data(data)
-        self._set_recent_rate_label(new_state)
-        embed = build_settings_embed(guild_data)
-        await interaction.response.edit_message(embed=embed, view=self)
+class DangerZoneSettingsView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
 
-    @discord.ui.button(label="Compact Leaderboard: OFF", style=discord.ButtonStyle.secondary, emoji="📏")
-    async def toggle_compact_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        guild_data = get_guild(data, self.guild_id)
-        new_state = not compact_leaderboard_enabled(guild_data)
-        guild_data["compact_leaderboard"] = new_state
-        save_data(data)
-        self._set_compact_label(new_state)
-        embed = build_settings_embed(guild_data)
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
-    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        guild_data = get_guild(data, self.guild_id)
-        self._set_recent_rate_label(show_recent_rate_enabled(guild_data))
-        self._set_compact_label(compact_leaderboard_enabled(guild_data))
-        self._set_pagination_label(leaderboard_pagination_enabled(guild_data))
-        embed = build_settings_embed(guild_data)
-        await interaction.response.edit_message(embed=embed, view=self)
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
 
     @discord.ui.button(label="Remove All Users", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def remove_all_users(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1575,6 +1770,61 @@ class SettingsView(discord.ui.View):
             ephemeral=True,
         )
         view.message = await interaction.original_response()
+
+
+def build_settings_category_view(category: str, guild_id: int, guild_data: dict) -> discord.ui.View:
+    if category == "requirement_week":
+        return RequirementWeekView(guild_id)
+    if category == "display":
+        return DisplaySettingsView(
+            guild_id,
+            show_recent_rate_enabled(guild_data),
+            compact_leaderboard_enabled(guild_data),
+            leaderboard_pagination_enabled(guild_data),
+        )
+    if category == "roles":
+        return RolesSettingsView(guild_id)
+    if category == "automation":
+        return AutomationSettingsView(guild_id, inactivity_includes_behind_pace(guild_data))
+    if category == "danger":
+        return DangerZoneSettingsView(guild_id)
+    return SettingsHomeView(guild_id)
+
+
+class SettingsCategorySelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=label, value=value, emoji=emoji, description=desc)
+            for value, label, emoji, desc in SETTINGS_CATEGORIES
+        ]
+        super().__init__(placeholder="Choose a settings category...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = self.view.guild_id
+        data = load_data()
+        guild_data = get_guild(data, guild_id)
+        view = build_settings_category_view(self.values[0], guild_id, guild_data)
+        embed = build_settings_embed(guild_data)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class SettingsHomeView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.add_item(SettingsCategorySelect())
+
+    @discord.ui.button(label="Manage a User", style=discord.ButtonStyle.secondary, emoji="👤")
+    async def manage_user(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = UserSelectView(self.guild_id)
+        await interaction.response.send_message("Select a user:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        embed = build_settings_embed(guild_data)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 # ---------------------------------------------------------------------------
 # Bot setup
@@ -1760,6 +2010,16 @@ async def on_ready():
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+@bot.tree.command(name="help", description="Show all bot commands, organized by category")
+async def help_cmd(interaction: discord.Interaction):
+    # Deliberately NOT gated by @require_tracking_channel() — if someone's
+    # in the wrong channel, /help is exactly what should still work
+    # everywhere so they can find the right one.
+    embed = build_help_overview_embed()
+    view = HelpView()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 
 @bot.tree.command(name="checkin", description="Record current total Roblox XP — yours, or (admin) someone else's")
 @app_commands.describe(
@@ -2139,12 +2399,7 @@ async def settings_cmd(interaction: discord.Interaction):
     guild_data = get_guild(data, interaction.guild_id)
     save_data(data)  # persist guild creation if this is the first time
     embed = build_settings_embed(guild_data)
-    view = SettingsView(
-        interaction.guild_id,
-        show_recent_rate=show_recent_rate_enabled(guild_data),
-        compact_leaderboard=compact_leaderboard_enabled(guild_data),
-        leaderboard_pagination=leaderboard_pagination_enabled(guild_data),
-    )
+    view = SettingsHomeView(interaction.guild_id)
     await interaction.response.send_message(embed=embed, view=view)
 
 

@@ -61,6 +61,7 @@ weekly requirement (default: 20,000 XP/week).
 
 | Command | Who | Description |
 |---|---|---|
+| `/help` | Everyone | Browse every command by category via a dropdown — works in any channel even if you've restricted others to one. |
 | `/settings` | Admin (Manage Server) | Opens an interactive panel with buttons and forms for everything below — no need to remember command syntax. See below. |
 | `/checkin xp:<number> [user]` | Everyone | Record current total XP. First checkin starts tracking. The `user` option lets an admin check in on someone else's behalf (e.g. if they can't use Discord themselves) — regular members can only check themselves in. |
 | `/status [user]` | Everyone | Show weekly progress, rate, and projection for yourself or another user. |
@@ -104,27 +105,40 @@ weekly requirement (default: 20,000 XP/week).
 
 ## Settings panel
 
-Running `/settings` opens an interactive panel (admins only) instead of typing out command parameters:
+Running `/settings` opens an interactive panel (admins only) instead of typing out command parameters. As of this version, it's organized into categories via a dropdown rather than one long row of buttons — pick a category, see just the controls relevant to it, and use **⬅ Back** to return to the category list.
 
-- **Set Requirement** — pops up a form to type in a new weekly XP goal
-- **Sync Week (Everyone)** — pops up a form with separate Days/Hours/Minutes fields plus whether to reset everyone's gained-so-far, applied to the whole server at once (same as `/setweekprogressall`)
-- **Prorate Threshold** — pops up a Days/Hours/Minutes form controlling how late someone must join to get a prorated requirement (same as `/setproratethreshold`)
-- **Add XP Role** — pick a role from a dropdown, then a form for the XP amount required (same as `/addxprole`)
-- **Remove XP Role** — pick a role from a dropdown to stop auto-assigning it (same as `/removexprole`)
-- **Sync XP Roles Now** — re-checks everyone's roles immediately (same as `/syncxproles`)
-- **Set Tracking Channel** — shows a channel dropdown to restrict tracking commands to (same as `/setchannel`)
-- **Set Announce Channel** — shows a channel dropdown for milestone announcements (same as `/setannouncechannel`)
-- **Set Weekly Post Channel** — shows a channel dropdown for the auto-posted weekly leaderboard (same as `/setweeklypost`)
-- **Set Inactivity Channel** — shows a channel dropdown for inactivity reminder pings (same as `/setinactivitychannel`)
-- **Pagination: ON/OFF** — toggles leaderboard paging (same as `/toggleleaderboardpagination`)
+**Home screen:**
+- **Category dropdown** — jump into any of the five categories below
 - **Manage a User** — shows a dropdown to pick a member, then buttons for: Set Week Progress, Set Starting XP, Reset Week, Undo Last Checkin, Full Reset, Remove User
-- **Remove All Users** — wipes every tracked user in the server; asks for confirmation first, same as `/removeallusers`
-- **Remove Departed Members** — wipes tracking data only for people no longer in the server; asks for confirmation first, same as `/removestaleusers`
-- **Recent Rate: ON/OFF** — toggles the "Recent Rate" field server-wide (see note below); the button's label and color reflect the current state
-- **Compact Leaderboard: ON/OFF** — toggles shorter leaderboard entries; also reflects current state
 - **Refresh** — updates the panel's numbers without re-running the command
 
-The panel expires after 5 minutes of inactivity — just run `/settings` again if that happens. It works alongside all the individual slash commands (`/setrequirement`, `/resetweek`, etc.), which still work exactly as before if you prefer typing them directly.
+**⏱️ Requirement & Week**
+- **Set Requirement** — pops up a form to type in a new weekly XP goal
+- **Sync Week (Everyone)** — Days/Hours/Minutes form plus whether to reset everyone's gained-so-far, applied server-wide (same as `/setweekprogressall`)
+- **Prorate Threshold** — Days/Hours/Minutes form controlling how late someone must join to get a prorated requirement (same as `/setproratethreshold`)
+
+**🎨 Display**
+- **Recent Rate: ON/OFF** — toggles the "Recent Rate" field server-wide (see note below)
+- **Compact Leaderboard: ON/OFF** — toggles shorter leaderboard entries
+- **Pagination: ON/OFF** — toggles Previous/Next leaderboard paging (same as `/toggleleaderboardpagination`)
+
+**🏅 XP Roles**
+- **Add XP Role** — pick a role from a dropdown, then a form for the XP amount and whether it's a ladder tier or permanent (same as `/addxprole`)
+- **Remove XP Role** — pick a role from a dropdown to stop auto-assigning it (same as `/removexprole`)
+- **Sync XP Roles Now** — re-checks everyone's roles immediately (same as `/syncxproles`)
+
+**📢 Channels & Automation**
+- **Tracking Channel** — restrict tracking commands to one channel (same as `/setchannel`)
+- **Announce Channel** — where milestone role announcements post (same as `/setannouncechannel`)
+- **Weekly Post Channel** — where the auto-posted weekly leaderboard goes (same as `/setweeklypost`)
+- **Inactivity Channel** — where inactivity reminder pings post (same as `/setinactivitychannel`)
+- **Inactivity: Zero Checkins Only / +Behind Pace** — toggles whether inactivity pings also flag behind-pace members (same as `/toggleinactivitybehindpace`)
+
+**⚠️ Danger Zone**
+- **Remove All Users** — wipes every tracked user in the server; asks for confirmation first, same as `/removeallusers`
+- **Remove Departed Members** — wipes tracking data only for people no longer in the server; asks for confirmation first, same as `/removestaleusers`
+
+Every button/dropdown expires after 5 minutes of inactivity — just run `/settings` again if that happens. It works alongside all the individual slash commands (`/setrequirement`, `/resetweek`, etc.), which still work exactly as before if you prefer typing them directly.
 
 ## Bulk importing starting XP from a spreadsheet
 
@@ -192,6 +206,8 @@ The bot can automatically assign a Discord role once someone's total XP crosses 
 Both `/status` and `/weeklyleaderboard` show a "📅 Week Runs" field with the actual calendar dates the current week spans (e.g. "July 27 → August 3"), rendered via Discord's timestamp tags so it automatically displays in each viewer's own local timezone rather than a fixed UTC string.
 
 On `/weeklyleaderboard`, this only shows a single shared range if your server uses `/setweekprogressall` to sync everyone's week; otherwise it notes that ranges vary per person (check `/status` for an individual's own window).
+
+`/status` also shows a text progress bar (e.g. `████████░░░░░░ 57%`) tracking gained-this-week against the requirement — the prorated amount, for anyone in a prorated first week, rather than the flat full number.
 
 ## Restricting commands to one channel
 
