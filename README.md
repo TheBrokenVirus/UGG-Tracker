@@ -80,6 +80,10 @@ weekly requirement (default: 20,000 XP/week).
 | `/syncxproles` | Admin | Re-checks every tracked member's roles right now — fixes leftover role clutter without waiting for everyone's next checkin. |
 | `/progresschart [user]` | Everyone | Shows a line chart of XP over time, built from that person's checkin history. Needs at least 2 checkins. |
 | `/exportdata [file_format]` | Admin | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
+| `/backup` | Admin | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
+| `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
+| `/setadminlogchannel channel:<#channel>` | Admin | Log destructive/data-altering admin actions to a channel. See below. |
+| `/clearadminlogchannel` | Admin | Turn off admin action logging. |
 | `/setchannel channel:<#channel>` | Admin | Restrict `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` to one channel. Admin/config commands still work anywhere. |
 | `/clearchannel` | Admin | Remove the channel restriction. |
 | `/setannouncechannel channel:<#channel>` | Admin | Post a public congratulations message whenever someone earns an XP milestone role. |
@@ -132,6 +136,7 @@ Running `/settings` opens an interactive panel (admins only) instead of typing o
 - **Announce Channel** — where milestone role announcements post (same as `/setannouncechannel`)
 - **Weekly Post Channel** — where the auto-posted weekly leaderboard goes (same as `/setweeklypost`)
 - **Inactivity Channel** — where inactivity reminder pings post (same as `/setinactivitychannel`)
+- **Admin Log Channel** — where destructive/data-altering admin actions get logged (same as `/setadminlogchannel`)
 - **Inactivity: Zero Checkins Only / +Behind Pace** — toggles whether inactivity pings also flag behind-pace members (same as `/toggleinactivitybehindpace`)
 
 **⚠️ Danger Zone**
@@ -235,6 +240,38 @@ Downloads a file with everyone's current stats: Discord ID, username, current XP
 
 **The `starting_xp` column name matches what `/importxp` expects**, so an exported file can be re-imported directly with no reformatting — export → (optionally edit) → `/importxp` that same file. What re-importing does depends on which `existing_users` mode you pick: **check in** treats each person's exported `current_xp` as a fresh checkin (history preserved) — the right choice for most re-imports; **reset** treats it as a full restart (history wiped), better suited to disaster recovery than routine use.
 
+## Backup & restore
+
+`/exportdata` only exports current stats — it doesn't capture your settings (requirement, week sync, XP roles, channels, toggles). For a true full snapshot:
+
+```
+/backup
+```
+
+Downloads a JSON file containing **everything**: every setting in `/settings`, every XP milestone role, and every tracked user's full history — not just their current numbers. Keep this file somewhere safe (not just in Discord, where messages can be deleted).
+
+```
+/restore file:<the .json from /backup>
+```
+
+Uploads that file back and **completely replaces** the server's current settings and tracked data with it — shows you how many users are in the backup and when it was taken before asking for confirmation, since this discards everything that's happened since that backup, not just undoes one action. This is real disaster-recovery, not the scoped undo that `/undoimport` provides for a single import.
+
+A backup taken with an older version of the bot (missing settings that didn't exist yet) restores fine — any keys not present in the file get filled in with current defaults rather than causing an error.
+
+## Admin action log
+
+With this many destructive commands now available (`/fullreset`, `/removeallusers`, `/undoimport`, `/restore`, and more), it's worth having a record of who did what, especially once more than one person has admin access.
+
+```
+/setadminlogchannel channel:#admin-log
+```
+
+Posts a log entry to that channel whenever an admin runs a data-affecting command — who did it, what it was, and relevant details (e.g. old value → new value, or how many users were affected). Covers: `/fullreset`, `/removeuser`, `/removeuserbyid`, `/removeallusers`, `/removestaleusers`, `/resetweek`, `/setweekprogress`, `/setweekprogressall`, `/setbaseline`, `/setrequirement`, `/addxprole`, `/removexprole`, `/importxp`, `/undoimport`, `/restore`, and admin-performed `/undo`s (not self-undos — those aren't really "admin actions" on someone else).
+
+Routine display toggles (`/togglerecentrate`, `/togglecompactleaderboard`, etc.) are deliberately **not** logged, to keep the log meaningful rather than noisy — it's focused on things that change tracked data or affect the whole server, not cosmetic preferences.
+
+Turn it off with `/clearadminlogchannel`.
+
 ## Progress charts
 
 ```
@@ -308,6 +345,14 @@ To customize the rotation text, edit the list inside `build_presence_statuses()`
 
 ## Notes & limitations
 
+- **`/restore` has no undo of its own**: unlike `/undoimport`, restoring a
+  backup doesn't snapshot the state it's about to overwrite — it's meant
+  for disaster recovery (a corrupted data file, a bad migration), not
+  routine experimentation. If you want to try `/restore` safely, run
+  `/backup` immediately beforehand to create a fallback point you can
+  restore back to if needed. This action is logged to the admin log
+  channel if one is configured, same as every other data-affecting
+  command.
 - **Scheduled posts and pings need the bot online at the right moment**:
   both the weekly auto-post and inactivity pings only fire during a
   narrow window before the week ends (about 20 minutes for the post,

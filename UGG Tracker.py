@@ -115,32 +115,50 @@ def save_data(data: dict) -> None:
 DEFAULT_PRORATE_THRESHOLD_HOURS = 168.0  # 7 days = always prorate any lateness (original behavior)
 DEFAULT_INACTIVITY_THRESHOLD_HOURS = 24.0  # ping people who haven't checked in when this much time is left
 
+def default_guild_data() -> dict:
+    """The default shape for a fresh guild entry. Also used by /restore to
+    fill in any keys missing from an older or hand-edited backup file."""
+    return {
+        "requirement": DEFAULT_WEEKLY_REQUIREMENT,
+        "users": {},
+        "week_anchor": None,
+        "show_recent_rate": True,
+        "compact_leaderboard": False,
+        "prorate_threshold_hours": DEFAULT_PRORATE_THRESHOLD_HOURS,
+        "xp_roles": [],
+        "restricted_channel_id": None,
+        "announce_channel_id": None,
+        "weekly_post_channel_id": None,
+        "last_weekly_post_marker": None,
+        "inactivity_channel_id": None,
+        "inactivity_threshold_hours": DEFAULT_INACTIVITY_THRESHOLD_HOURS,
+        "last_inactivity_ping_marker": None,
+        "inactivity_include_behind_pace": False,
+        "leaderboard_pagination": False,
+        "admin_log_channel_id": None,
+    }
+
 def get_guild(data: dict, guild_id: int) -> dict:
     gid = str(guild_id)
     if gid not in data["guilds"]:
-        data["guilds"][gid] = {
-            "requirement": DEFAULT_WEEKLY_REQUIREMENT,
-            "users": {},
-            "week_anchor": None,
-            "show_recent_rate": True,
-            "compact_leaderboard": False,
-            "prorate_threshold_hours": DEFAULT_PRORATE_THRESHOLD_HOURS,
-            "xp_roles": [],
-            "restricted_channel_id": None,
-            "announce_channel_id": None,
-            "weekly_post_channel_id": None,
-            "last_weekly_post_marker": None,
-            "inactivity_channel_id": None,
-            "inactivity_threshold_hours": DEFAULT_INACTIVITY_THRESHOLD_HOURS,
-            "last_inactivity_ping_marker": None,
-            "inactivity_include_behind_pace": False,
-            "leaderboard_pagination": False,
-        }
+        data["guilds"][gid] = default_guild_data()
     return data["guilds"][gid]
+
+def normalize_guild_data(guild_data: dict) -> dict:
+    """Fills in any keys missing from a guild_data dict (e.g. one restored
+    from an older backup taken before some settings existed) using current
+    defaults, without touching keys that are already present."""
+    merged = default_guild_data()
+    merged.update(guild_data)
+    return merged
 
 def get_restricted_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
     return guild_data.get("restricted_channel_id")
+
+def get_admin_log_channel_id(guild_data: dict) -> Optional[int]:
+    """Backward-compatible getter — older guild entries won't have this key."""
+    return guild_data.get("admin_log_channel_id")
 
 def inactivity_includes_behind_pace(guild_data: dict) -> bool:
     """Backward-compatible getter — older guild entries won't have this key."""
@@ -288,6 +306,34 @@ async def announce_role_milestone(guild: discord.Guild, guild_data: dict, member
         description=f"{member.mention} just earned {role_names}!",
         color=discord.Color.gold(),
     )
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+async def log_admin_action(
+    guild: discord.Guild, guild_data: dict, admin: discord.abc.User, action: str,
+    target: Optional[str] = None, details: Optional[str] = None,
+):
+    """Posts a record of a data-affecting admin action to the configured
+    log channel, if one is set via /setadminlogchannel. Covers destructive
+    or data-altering commands — not routine display toggles, to keep the
+    log meaningful rather than noisy. Never raises — a logging failure
+    should never block the actual action from completing."""
+    channel_id = get_admin_log_channel_id(guild_data)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    embed = discord.Embed(title="🛡️ Admin Action", color=discord.Color.dark_grey(), timestamp=utcnow())
+    embed.add_field(name="Action", value=action, inline=True)
+    embed.add_field(name="By", value=admin.mention, inline=True)
+    if target:
+        embed.add_field(name="Target", value=target, inline=True)
+    if details:
+        embed.add_field(name="Details", value=details, inline=False)
     try:
         await channel.send(embed=embed)
     except discord.HTTPException:
@@ -765,6 +811,8 @@ def build_settings_embed(guild_data: dict) -> discord.Embed:
         value="On" if leaderboard_pagination_enabled(guild_data) else "Off",
         inline=True,
     )
+    admin_log_ch = get_admin_log_channel_id(guild_data)
+    embed.add_field(name="Admin Action Log", value=f"<#{admin_log_ch}>" if admin_log_ch else "Off", inline=True)
 
     embed.set_footer(text="Use the buttons below to change settings. Panel expires after 5 minutes of inactivity.")
     return embed
@@ -1073,6 +1121,26 @@ class SetInactivityChannelView(discord.ui.View):
         )
 
 
+class SetAdminLogChannelView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text],
+                        placeholder="Choose the channel for admin action logs")
+    async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        channel = select.values[0]
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        guild_data["admin_log_channel_id"] = channel.id
+        save_data(data)
+        await interaction.response.send_message(
+            f"Admin actions (resets, removals, imports, requirement changes, etc.) will now be logged "
+            f"in {channel.mention}. Turn off with `/clearadminlogchannel`.",
+            ephemeral=True,
+        )
+
+
 class SyncWeekModal(discord.ui.Modal, title="Sync Week Progress (Everyone)"):
     days = discord.ui.TextInput(label="Days (0-7)", placeholder="e.g. 3", required=False, max_length=3)
     hours = discord.ui.TextInput(label="Hours (0-23)", placeholder="e.g. 12", required=False, max_length=3)
@@ -1213,6 +1281,10 @@ class ConfirmRemoveAllView(discord.ui.View):
             content=f"✅ Removed tracking data for **{removed}** user(s). Everyone starts fresh with their next `/checkin`.",
             view=self,
         )
+        await log_admin_action(
+            interaction.guild, guild_data, interaction.user, "Removed ALL users",
+            details=f"{removed} user(s) removed.",
+        )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1255,6 +1327,10 @@ class ConfirmRemoveStaleView(discord.ui.View):
         await interaction.response.edit_message(
             content=f"✅ Removed tracking data for **{removed}** member(s) no longer in the server.",
             view=self,
+        )
+        await log_admin_action(
+            interaction.guild, guild_data, interaction.user, "Removed departed members",
+            details=f"{removed} member(s) removed.",
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
@@ -1300,6 +1376,50 @@ class ConfirmUndoImportView(discord.ui.View):
         await interaction.response.edit_message(
             content="✅ Reverted to how tracking data looked before that import ran.",
             view=self,
+        )
+        await log_admin_action(interaction.guild, guild_data, interaction.user, "Undid last import")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="Confirmation timed out — nothing was changed.", view=self)
+            except discord.HTTPException:
+                pass
+
+
+class ConfirmRestoreView(discord.ui.View):
+    """Two-step confirmation for restoring a full /backup — replaces
+    EVERY setting and every tracked user's data for this server."""
+
+    def __init__(self, guild_id: int, restored_guild_data: dict):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.restored_guild_data = restored_guild_data
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Confirm — Restore Backup", style=discord.ButtonStyle.danger, emoji="♻️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        normalized = normalize_guild_data(self.restored_guild_data)
+        data["guilds"][str(self.guild_id)] = normalized
+        save_data(data)
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ Backup restored — {len(normalized['users'])} tracked user(s), all settings replaced.",
+            view=self,
+        )
+        await log_admin_action(
+            interaction.guild, normalized, interaction.user, "Restored full backup",
+            details=f"{len(normalized['users'])} tracked user(s) after restore.",
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
@@ -1715,7 +1835,12 @@ class AutomationSettingsView(discord.ui.View):
         view = SetInactivityChannelView(self.guild_id)
         await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
 
-    @discord.ui.button(label="Inactivity: Zero Checkins Only", style=discord.ButtonStyle.secondary, emoji="🎯", row=1)
+    @discord.ui.button(label="Admin Log Channel", style=discord.ButtonStyle.primary, emoji="🛡️", row=1)
+    async def set_admin_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = SetAdminLogChannelView(self.guild_id)
+        await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Inactivity: Zero Checkins Only", style=discord.ButtonStyle.secondary, emoji="🎯", row=2)
     async def toggle_behind_pace(self, interaction: discord.Interaction, button: discord.ui.Button):
         data = load_data()
         guild_data = get_guild(data, self.guild_id)
@@ -2376,6 +2501,8 @@ async def undo(interaction: discord.Interaction, user: Optional[discord.Member] 
         # Undoing the only checkin means wiping the user's tracking entirely.
         del guild_data["users"][str(target.id)]
         save_data(data)
+        if target.id != interaction.user.id:
+            await log_admin_action(interaction.guild, guild_data, interaction.user, "Undo (removed only checkin)", target=target.mention)
         await interaction.response.send_message(
             f"Removed {target.display_name}'s only checkin — tracking has been reset. "
             f"Use `/checkin` to start again."
@@ -2385,6 +2512,11 @@ async def undo(interaction: discord.Interaction, user: Optional[discord.Member] 
     removed = entry["checkins"].pop()
     entry["current_xp"] = entry["checkins"][-1]["xp"]
     save_data(data)
+    if target.id != interaction.user.id:
+        await log_admin_action(
+            interaction.guild, guild_data, interaction.user, "Undo checkin",
+            target=target.mention, details=f"Reverted {removed['xp']:,} XP to {entry['current_xp']:,} XP.",
+        )
 
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
     embed = build_status_embed(target, entry, stats, guild_data["requirement"], show_recent_rate=show_recent_rate_enabled(guild_data))
@@ -2588,6 +2720,29 @@ async def clearinactivitychannel(interaction: discord.Interaction):
     await interaction.response.send_message("Inactivity reminder pings are now off.")
 
 
+@bot.tree.command(name="setadminlogchannel", description="[Admin] Log destructive/data-altering admin actions to a channel")
+@app_commands.describe(channel="Channel where admin action logs will be posted")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setadminlogchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["admin_log_channel_id"] = channel.id
+    save_data(data)
+    await interaction.response.send_message(
+        f"Admin actions (resets, removals, imports, requirement changes, etc.) will now be logged in {channel.mention}."
+    )
+
+
+@bot.tree.command(name="clearadminlogchannel", description="[Admin] Turn off the admin action log")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clearadminlogchannel(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["admin_log_channel_id"] = None
+    save_data(data)
+    await interaction.response.send_message("Admin action logging is now off.")
+
+
 @bot.tree.command(name="setinactivitythreshold", description="[Admin] Set how long before week-end inactivity pings fire")
 @app_commands.describe(
     days="Time-before-week-end threshold, days part (0-7)",
@@ -2654,8 +2809,13 @@ async def toggleleaderboardpagination(interaction: discord.Interaction, enabled:
 async def setrequirement(interaction: discord.Interaction, xp: int):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
+    old_xp = guild_data["requirement"]
     guild_data["requirement"] = xp
     save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Changed weekly requirement",
+        details=f"{old_xp:,} XP → {xp:,} XP",
+    )
     await interaction.response.send_message(f"Weekly requirement set to **{xp:,} XP**.")
 
 
@@ -2674,7 +2834,83 @@ async def resetweek(interaction: discord.Interaction, user: discord.Member):
     entry["week_start_time"] = iso(utcnow())
     entry["week_start_xp"] = entry["current_xp"]
     save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Reset weekly window", target=user.mention)
     await interaction.response.send_message(f"Weekly tracking window reset for {user.display_name}.")
+
+
+@bot.tree.command(name="backup", description="[Admin] Download a full backup of ALL settings and tracked data for this server")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def backup_cmd(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    save_data(data)  # persist any lazy guild creation
+
+    payload = {
+        "backup_version": 1,
+        "backup_time": iso(utcnow()),
+        "guild_id": interaction.guild_id,
+        "guild_name": interaction.guild.name,
+        "guild_data": guild_data,
+    }
+    json_bytes = io.BytesIO(json.dumps(payload, indent=2).encode("utf-8"))
+    timestamp = utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"xp_backup_{timestamp}.json"
+
+    await interaction.response.send_message(
+        content=(
+            f"Full backup — **{len(guild_data['users'])}** tracked user(s), plus every setting "
+            f"(requirement, week sync, XP roles, channels, toggles). This is different from "
+            f"`/exportdata`, which only exports current stats, not settings. Keep this file "
+            f"somewhere safe; `/restore` can rebuild everything from it."
+        ),
+        file=discord.File(fp=json_bytes, filename=filename),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="restore", description="[Admin] Restore ALL settings and tracked data from a /backup file — replaces everything")
+@app_commands.describe(file="The .json file downloaded from /backup")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def restore_cmd(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    try:
+        raw = await file.read()
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        await interaction.followup.send(
+            "Couldn't read that file — make sure it's a valid backup .json produced by `/backup`.", ephemeral=True
+        )
+        return
+
+    if not isinstance(payload, dict) or "guild_data" not in payload:
+        await interaction.followup.send(
+            "That doesn't look like a valid backup file — missing the expected `guild_data` field.", ephemeral=True
+        )
+        return
+
+    restored_guild_data = payload["guild_data"]
+    if not isinstance(restored_guild_data, dict) or "users" not in restored_guild_data:
+        await interaction.followup.send("That backup file's data looks malformed — can't safely restore it.", ephemeral=True)
+        return
+
+    user_count = len(restored_guild_data.get("users", {}))
+    backup_time_str = payload.get("backup_time")
+    try:
+        backup_ts = int(parse_iso(backup_time_str).timestamp())
+        time_str = f"<t:{backup_ts}:R>"
+    except (TypeError, ValueError):
+        time_str = "at an unknown time"
+
+    view = ConfirmRestoreView(interaction.guild_id, restored_guild_data)
+    await interaction.followup.send(
+        f"⚠️ This will **completely replace** all settings and tracked data for this server with "
+        f"a backup taken {time_str} (**{user_count}** tracked user(s) in that backup). Everything "
+        f"currently in place — including anything that's happened since that backup — will be lost. "
+        f"This can't be undone with `/undoimport` or any other command. Continue?",
+        view=view,
+    )
+    view.message = await interaction.original_response()
 
 
 @bot.tree.command(name="exportdata", description="[Admin] Export everyone's current stats to a CSV or Excel file")
@@ -2870,6 +3106,14 @@ async def importxp(
 
     save_data(data)
 
+    await log_admin_action(
+        guild, guild_data, interaction.user, "Bulk import (/importxp)",
+        details=(
+            f"Mode: {mode}. Created: {len(created)}, Checked in: {len(checked_in)}, "
+            f"Reset: {len(reset_list)}, Skipped: {len(skipped)}, Unmatched: {len(unmatched)}."
+        ),
+    )
+
     def fmt_list(items, limit=15):
         if not items:
             return "—"
@@ -2998,6 +3242,10 @@ async def addxprole(interaction: discord.Interaction, xp: int, role: discord.Rol
 
     kind = "part of the tier ladder (will be replaced by a higher tier)" if exclusive else "permanent (kept even after higher tiers are reached)"
     note = f" Retroactively granted to **{granted}** member(s) who already qualify." if granted else ""
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Added XP milestone role",
+        target=role.mention, details=f"{xp:,} XP threshold, {'exclusive' if exclusive else 'permanent'}.",
+    )
     await interaction.followup.send(
         f"Members reaching **{xp:,} XP** will now automatically receive {role.mention} — {kind}.{note}"
     )
@@ -3015,6 +3263,7 @@ async def removexprole(interaction: discord.Interaction, role: discord.Role):
     save_data(data)
 
     if len(xp_roles) < before:
+        await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed XP milestone role", target=role.mention)
         await interaction.response.send_message(
             f"{role.mention} will no longer be auto-assigned. Members who already have it keep it — "
             f"this only stops *new* assignments."
@@ -3110,6 +3359,10 @@ async def setbaseline(interaction: discord.Interaction, user: discord.Member, st
     save_data(data)
 
     total_gained = entry["current_xp"] - starting_xp
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Set all-time starting XP",
+        target=user.mention, details=f"Baseline set to {starting_xp:,} XP.",
+    )
     await interaction.response.send_message(
         f"Set {user.display_name}'s all-time starting XP to **{starting_xp:,}**. "
         f"Total gained is now **{total_gained:,} XP** (from current total of {entry['current_xp']:,})."
@@ -3152,6 +3405,10 @@ async def setweekprogress(
         entry["week_start_xp"] = week_start_xp
     save_data(data)
 
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Set week progress",
+        target=user.mention, details=f"{format_timedelta(delta)} elapsed" + (f", week-start XP set to {week_start_xp:,}" if week_start_xp is not None else ""),
+    )
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
     embed = build_status_embed(user, entry, stats, guild_data["requirement"], show_recent_rate=show_recent_rate_enabled(guild_data))
     embed.description = f"Week progress set to **{format_timedelta(delta)} elapsed** for {user.display_name}."
@@ -3196,6 +3453,10 @@ async def setweekprogressall(
     save_data(data)
 
     gains_note = " Everyone's gained-so-far was also reset to 0." if reset_gains else " Existing gained-so-far totals were kept."
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Set week progress (everyone)",
+        details=f"{format_timedelta(delta)} elapsed for {count} user(s).{gains_note}",
+    )
     await interaction.response.send_message(
         f"Set week progress to **{format_timedelta(delta)} elapsed** "
         f"for **{count}** tracked user(s).{gains_note} "
@@ -3236,6 +3497,10 @@ async def fullreset(interaction: discord.Interaction, user: discord.Member, clea
     save_data(data)
 
     history_note = " Checkin history was also cleared." if clear_history else " Checkin history was kept."
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Full reset",
+        target=user.mention, details=f"Reset to {current_xp:,} XP.{history_note}",
+    )
     await interaction.response.send_message(
         f"Fully reset {user.display_name} — both weekly and all-time totals now start from their "
         f"current XP of **{current_xp:,}**.{history_note}"
@@ -3271,6 +3536,7 @@ async def removeuser(interaction: discord.Interaction, user: discord.Member):
     if str(user.id) in guild_data["users"]:
         del guild_data["users"][str(user.id)]
         save_data(data)
+        await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed user", target=user.mention)
         await interaction.response.send_message(f"Removed tracking data for {user.display_name}.")
     else:
         await interaction.response.send_message("No data found for that user.", ephemeral=True)
@@ -3296,6 +3562,7 @@ async def removeuserbyid(interaction: discord.Interaction, discord_id: str):
         save_data(data)
         member = interaction.guild.get_member(int(uid))
         name = member.display_name if member else f"user {uid} (no longer in this server)"
+        await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed user by ID", target=name)
         await interaction.response.send_message(f"Removed tracking data for {name}.")
     else:
         await interaction.response.send_message("No tracking data found for that ID.", ephemeral=True)
@@ -3358,11 +3625,15 @@ setweeklypost.error(_perm_error)
 clearweeklypost.error(_perm_error)
 setinactivitychannel.error(_perm_error)
 clearinactivitychannel.error(_perm_error)
+setadminlogchannel.error(_perm_error)
+clearadminlogchannel.error(_perm_error)
 setinactivitythreshold.error(_perm_error)
 toggleinactivitybehindpace.error(_perm_error)
 toggleleaderboardpagination.error(_perm_error)
 exportdata.error(_perm_error)
 undoimport.error(_perm_error)
+backup_cmd.error(_perm_error)
+restore_cmd.error(_perm_error)
 togglerecentrate.error(_perm_error)
 togglecompactleaderboard.error(_perm_error)
 setproratethreshold.error(_perm_error)
