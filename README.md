@@ -66,6 +66,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/status [user]` | Everyone | Show weekly progress, rate, and projection for yourself or another user. |
 | `/weeklyleaderboard` | Everyone | Ranked list of everyone's XP gained *this week*, with on-track indicators. |
 | `/totalleaderboard` | Everyone | Ranked by each person's *actual total XP* (starting point + everything gained since), not just the gain alone. |
+| `/crewtotals` | Everyone | The whole crew's combined XP added together — total XP and this week's gain, summed across everyone tracked (including anyone no longer in the server). |
 | `/history [user]` | Everyone | Last 10 checkins for a user. |
 | `/undo [user]` | Everyone (own checkins); Admin for others | Remove the most recent checkin and revert current XP to the one before it. If it was someone's only checkin, tracking resets entirely. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
@@ -299,6 +300,13 @@ To customize the rotation text, edit the list inside `build_presence_statuses()`
   `/removeuserbyid` (paste their raw Discord ID instead of picking from a
   list) for one person, or `/removestaleusers` to bulk-clean everyone
   tracked who's no longer in the server in one confirmation-gated action.
+- **Departed members still count toward crew-wide totals**: `/crewtotals`
+  and per-person leaderboard entries include everyone in the tracking
+  data, whether or not they're still in the server — someone who was
+  kicked mid-week still contributed real XP, so it stays counted. If you
+  want a departed member's numbers fully out of the totals (not just
+  hidden from the member list), remove their data with `/removeuserbyid`
+  or `/removestaleusers` first.
 
 
 - **First-week requirement is automatically prorated for late joiners**:

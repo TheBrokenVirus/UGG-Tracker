@@ -1924,6 +1924,45 @@ async def totalleaderboard(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="crewtotals", description="Show the whole crew's combined XP — total and this week's gain")
+@require_tracking_channel()
+async def crewtotals(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+
+    if not guild_data["users"]:
+        await interaction.response.send_message("No one is being tracked yet. Use `/checkin` to get started.")
+        return
+
+    total_current_xp = 0
+    total_gained_week = 0
+    total_alltime_gained = 0
+    on_track_count = 0
+    member_count = len(guild_data["users"])
+
+    for uid, entry in guild_data["users"].items():
+        stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+        baseline_xp, _ = get_baseline(entry)
+        total_current_xp += entry["current_xp"]
+        total_gained_week += stats["gained_this_week"]
+        total_alltime_gained += entry["current_xp"] - baseline_xp
+        if stats["on_track"]:
+            on_track_count += 1
+    save_data(data)  # persist any lazy baseline migration or week rollovers triggered above
+
+    avg_weekly = total_gained_week / member_count if member_count else 0
+
+    embed = discord.Embed(title="👥 Crew XP Totals", color=discord.Color.blurple())
+    embed.add_field(name="Total XP (crew)", value=f"{total_current_xp:,}", inline=True)
+    embed.add_field(name="Gained This Week (crew)", value=f"{total_gained_week:,}", inline=True)
+    embed.add_field(name="All-Time Gained (crew)", value=f"{total_alltime_gained:,}", inline=True)
+    embed.add_field(name="Tracked Members", value=str(member_count), inline=True)
+    embed.add_field(name="On Track This Week", value=f"{on_track_count}/{member_count}", inline=True)
+    embed.add_field(name="Avg XP/Member This Week", value=f"{avg_weekly:,.0f}", inline=True)
+    embed.set_footer(text="Includes members no longer in the server — their tracked XP still counts toward crew totals.")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="history", description="Show recent XP checkins for a user")
 @app_commands.describe(user="User to check (defaults to you)")
 @require_tracking_channel()
@@ -2940,6 +2979,7 @@ weeklyleaderboard.error(_channel_error)
 totalleaderboard.error(_channel_error)
 history.error(_channel_error)
 progresschart.error(_channel_error)
+crewtotals.error(_channel_error)
 undo.error(_channel_error)
 removeallusers.error(_perm_error)
 
