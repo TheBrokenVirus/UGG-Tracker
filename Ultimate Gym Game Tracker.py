@@ -15,6 +15,8 @@ import csv
 import copy
 import io
 import json
+import math
+import colorsys
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta, timezone
@@ -914,6 +916,44 @@ def _fit_text_to_width(draw: "ImageDraw.ImageDraw", text: str, font, max_width: 
         text = text[:-1]
     return (text + "…") if text else "…"
 
+def _readable_text_variant(rgb: tuple, min_lightness: float = 0.62, min_saturation: float = 0.35) -> tuple:
+    """A border color that looks great as a thick outline or filled bar
+    can still be too dark/muted to read comfortably as text against a
+    dark background (Slate, Obsidian, and similar presets especially).
+    This returns a brightened version — same hue, boosted lightness and
+    saturation — for text use specifically, while the true color is kept
+    everywhere else (border, ring, bar) so the assigned color still
+    reads correctly there."""
+    r, g, b = (c / 255 for c in rgb[:3])
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = max(l, min_lightness)
+    s = max(s, min_saturation)
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return (int(r2 * 255), int(g2 * 255), int(b2 * 255), 255)
+
+def _star_points(cx: float, cy: float, outer_r: float, inner_r: float, points: int = 5) -> list:
+    """Vertex list for a filled 5-pointed star, for draw.polygon(). Used
+    instead of the ★ Unicode character, since Windows' Arial (a common
+    fallback font) doesn't reliably include glyphs from the Misc Symbols
+    block — drawing it as a shape guarantees it always renders, on any
+    platform, regardless of font glyph coverage."""
+    pts = []
+    angle_step = math.pi / points
+    start_angle = -math.pi / 2  # first point straight up
+    for i in range(points * 2):
+        r = outer_r if i % 2 == 0 else inner_r
+        angle = start_angle + i * angle_step
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    return pts
+
+def _triangle_points(cx: float, cy: float, size: float, pointing_up: bool) -> list:
+    """Vertex list for a small filled triangle, for draw.polygon(). Used
+    instead of the ▲/▼ Unicode characters for the same font-coverage
+    reason as _star_points."""
+    if pointing_up:
+        return [(cx, cy - size), (cx - size, cy + size), (cx + size, cy + size)]
+    return [(cx, cy + size), (cx - size, cy - size), (cx + size, cy - size)]
+
 def get_border_color(entry: dict) -> str:
     """Backward-compatible getter — entries created before this feature
     won't have a border_color key."""
@@ -941,24 +981,26 @@ async def build_profile_card(
     rank_change, if given, is current-vs-yesterday's-snapshot rank
     movement (positive = moved up). Returns None if Pillow isn't installed.
 
-    Rendered at 3x resolution and downscaled with a smoothing filter
-    (supersampling) — PIL doesn't anti-alias its own drawing, so every
-    curved edge (border, avatar ring, progress bar) would otherwise look
-    jagged at the final size. This trades a bit of render time for
-    noticeably smoother output."""
+    Rendered at high internal resolution and downscaled with a smoothing
+    filter (supersampling) — PIL doesn't anti-alias its own drawing, so
+    every curved edge (border, avatar ring, progress bar) would otherwise
+    look jagged at the final size. The rank-1 star and rank-change arrows
+    are drawn as vector shapes rather than Unicode glyphs (★/▲/▼) — Arial,
+    a common Windows fallback font, doesn't reliably include those glyph
+    blocks, so text rendering could silently fail to show them on some
+    platforms. Shapes always render correctly regardless of font."""
     if Image is None:
         return None
 
     # Rendered at a higher factor than the final shipped size (see resize
     # at the bottom): SCALE controls anti-aliasing quality during drawing,
-    # FINAL_W/FINAL_H controls what actually gets sent to Discord. Shipping
-    # only 900x300 looked blurry in Discord's inline chat preview, since
-    # Discord shrinks it further for that thumbnail and there wasn't
-    # enough source detail left to survive being displayed small — a
-    # higher native resolution fixes that without changing the design.
+    # FINAL_W/FINAL_H controls what actually gets sent to Discord — set
+    # well above the card's own design size so Discord's inline chat
+    # preview (which shrinks images further for its thumbnail) still has
+    # enough source detail to look sharp rather than blurry.
     SCALE = 5
-    FINAL_W, FINAL_H = 1350, 450
-    CARD_W, CARD_H = 900 * SCALE, 300 * SCALE
+    FINAL_W, FINAL_H = 1350, 510
+    CARD_W, CARD_H = 900 * SCALE, 340 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
     WHITE = (245, 246, 248, 255)
@@ -971,6 +1013,7 @@ async def build_profile_card(
 
     border_hex = get_border_color(entry)
     border_rgb = _hex_to_rgb(border_hex) + (255,)
+    rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
 
     # Fetch avatar bytes directly through discord.py's Asset — no extra HTTP client needed
     try:
@@ -1004,7 +1047,7 @@ async def build_profile_card(
         radius=22 * SCALE, outline=border_rgb, width=8 * SCALE,
     )
 
-    avatar_size = 200 * SCALE
+    avatar_size = 220 * SCALE
     avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
     avatar_img = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
     mask = Image.new("L", (avatar_size, avatar_size), 0)
@@ -1018,60 +1061,71 @@ async def build_profile_card(
     card.paste(avatar_img, avatar_pos, mask)
 
     text_x = 35 * SCALE + avatar_size + 45 * SCALE
-    font_name = _find_profile_font(True, 42 * SCALE)
-    font_rank = _find_profile_font(True, 27 * SCALE)
-    font_change = _find_profile_font(True, 20 * SCALE)
-    font_stat_label = _find_profile_font(False, 18 * SCALE)
-    font_stat_value = _find_profile_font(True, 26 * SCALE)
-    font_bar_label = _find_profile_font(False, 14 * SCALE)
+    font_name = _find_profile_font(True, 44 * SCALE)
+    font_rank = _find_profile_font(True, 29 * SCALE)
+    font_change = _find_profile_font(True, 21 * SCALE)
+    font_stat_label = _find_profile_font(False, 19 * SCALE)
+    font_stat_value = _find_profile_font(True, 28 * SCALE)
+    font_bar_label = _find_profile_font(False, 15 * SCALE)
 
     max_name_width = CARD_W - text_x - 40 * SCALE  # same right margin used by the bar/stats below
     display_name = _fit_text_to_width(draw, member.display_name, font_name, max_name_width)
-    draw.text((text_x, 42 * SCALE), display_name, font=font_name, fill=WHITE)
+    draw.text((text_x, 46 * SCALE), display_name, font=font_name, fill=WHITE)
+
+    rank_y = 118 * SCALE
+    rank_text_x = text_x
+    if rank == 1:
+        star_outer_r = 12 * SCALE
+        star_cx = text_x + star_outer_r
+        star_cy = rank_y + 17 * SCALE
+        draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
+        rank_text_x = text_x + star_outer_r * 2 + 10 * SCALE
 
     rank_line = f"Rank #{rank} of {total_members}"
-    if rank == 1:
-        rank_line = "★ " + rank_line
-    rank_color = GOLD_ACCENT if rank == 1 else border_rgb
-    draw.text((text_x, 100 * SCALE), rank_line, font=font_rank, fill=rank_color)
+    draw.text((rank_text_x, rank_y), rank_line, font=font_rank, fill=rank_text_rgb)
 
     if rank_change is not None:
-        change_x = text_x + draw.textlength(rank_line, font=font_rank) + 14 * SCALE
-        change_y = 100 * SCALE + 4 * SCALE
+        badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
+        badge_cy = rank_y + 19 * SCALE
         if rank_change > 0:
-            draw.text((change_x, change_y), f"▲{rank_change}", font=font_change, fill=RANK_UP_GREEN)
+            draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
+            draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
         elif rank_change < 0:
-            draw.text((change_x, change_y), f"▼{abs(rank_change)}", font=font_change, fill=RANK_DOWN_RED)
+            draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
+            draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
         else:
-            draw.text((change_x, change_y), "—", font=font_change, fill=MUTED_TEXT)
+            draw.rounded_rectangle(
+                [badge_x, badge_cy - 3 * SCALE, badge_x + 16 * SCALE, badge_cy + 3 * SCALE],
+                radius=3 * SCALE, fill=MUTED_TEXT,
+            )
 
     if next_milestone:
         needed, role_name = next_milestone
-        milestone_font = _find_profile_font(False, 16 * SCALE)
+        milestone_font = _find_profile_font(False, 17 * SCALE)
         draw.text(
-            (text_x, 132 * SCALE), f"{needed:,} XP to {role_name}",
+            (text_x, 156 * SCALE), f"{needed:,} XP to {role_name}",
             font=milestone_font, fill=MUTED_TEXT,
         )
 
-    stat_y = 165 * SCALE
+    stat_y = 200 * SCALE
     draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
-    draw.text((text_x, stat_y + 24 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
+    draw.text((text_x, stat_y + 28 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
 
-    stat_x2 = text_x + 280 * SCALE
+    stat_x2 = text_x + 290 * SCALE
     draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
     week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
-    draw.text((stat_x2, stat_y + 24 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+    draw.text((stat_x2, stat_y + 28 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
 
-    bar_x, bar_y = text_x, 245 * SCALE
-    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 22 * SCALE
+    bar_x, bar_y = text_x, 296 * SCALE
+    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 24 * SCALE
     effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
     pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
-    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=11 * SCALE, fill=BAR_BG)
+    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=12 * SCALE, fill=BAR_BG)
     if pct > 0:
         fill_w = max(int(bar_w * pct), bar_h)
-        draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=11 * SCALE, fill=border_rgb)
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=12 * SCALE, fill=border_rgb)
     draw.text(
-        (bar_x, bar_y - 20 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
+        (bar_x, bar_y - 24 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
         font=font_bar_label, fill=MUTED_TEXT,
     )
 
