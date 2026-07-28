@@ -128,7 +128,7 @@ weekly requirement (default: 20,000 XP/week).
 Running `/settings` opens an interactive panel (admins only) instead of typing out command parameters. As of this version, it's organized into categories via a dropdown rather than one long row of buttons — pick a category, see just the controls relevant to it, and use **⬅ Back** to return to the category list.
 
 **Home screen:**
-- **Category dropdown** — jump into any of the five categories below
+- **Category dropdown** — jump into any of the categories below
 - **Manage a User** — shows a dropdown to pick a member, then buttons for: Set Week Progress, Set Starting XP, Set Border Color, Reset Week, Undo Last Checkin, Full Reset, Remove User
 - **Refresh** — updates the panel's numbers without re-running the command
 
@@ -141,11 +141,17 @@ Running `/settings` opens an interactive panel (admins only) instead of typing o
 - **Recent Rate: ON/OFF** — toggles the "Recent Rate" field server-wide (see note below)
 - **Compact Leaderboard: ON/OFF** — toggles shorter leaderboard entries
 - **Pagination: ON/OFF** — toggles Previous/Next leaderboard paging (same as `/toggleleaderboardpagination`)
+- **Animated Profiles: ON/OFF** — toggles the rainbow-tier `/profile` GIF server-wide (same as `/toggleanimatedprofile`)
 
 **🏅 XP Roles**
 - **Add XP Role** — pick a role from a dropdown, then a form for the XP amount and whether it's a ladder tier or permanent (same as `/addxprole`)
 - **Remove XP Role** — pick a role from a dropdown to stop auto-assigning it (same as `/removexprole`)
 - **Sync XP Roles Now** — re-checks everyone's roles immediately (same as `/syncxproles`)
+
+**🎗️ Banner Tiers**
+- **Add / Edit Tier** — pick a role from a dropdown, then a form for the tier's name (the badge text shown on `/profile`), mode (`solid`/`gradient`/`rainbow`), color(s), and priority. Picking a role that already has a tier opens the form pre-filled with its current values — this is also how you rename a tier's badge or change its colors later, not just how you create a new one (same underlying data as `/addbannertier`).
+- **Remove Tier** — pick a role from a dropdown to remove its tier (same as `/removebannertier`)
+- **List Tiers** — shows every configured tier, its role, mode, and colors (same as `/listbannertiers`)
 
 **📢 Channels & Automation**
 - **Tracking Channel** — restrict tracking commands to one channel (same as `/setchannel`)
@@ -311,7 +317,11 @@ Chart generation depends on the `matplotlib` package (already in `requirements.t
 
 Renders an image card — avatar with a colored ring, name, rank, Crew XP, this week's gain, and a progress bar toward the weekly requirement — instead of a plain text embed. Rank is calculated the same way as `/totalleaderboard`: by actual total XP, so it includes each person's starting point, not just XP gained while tracked.
 
-If any XP milestone roles are configured (see "XP milestone roles" below), the card also shows how much XP is needed for the next one not yet reached — e.g. "4,784 XP to Gold". Rank #1 gets a gold star and gold-accented rank text regardless of banner tier, so the top spot always stands out. Rank text otherwise uses a brightened, boosted-saturation version of the tier's primary color — the raw color looks great as a thick border/ring, but some colors (dark, muted ones especially) are too hard to read comfortably as plain text against the card's dark background, so text specifically gets a readability boost while the border, ring, and progress bar keep the true color. The card is drawn at high internal resolution and downscaled for smooth, anti-aliased edges rather than the jagged look raw drawing would otherwise produce, then shipped at 1350×510 — a higher native resolution than the card's actual design size, so it still looks sharp in Discord's small inline chat preview rather than blurry. Long display names are truncated based on actual rendered pixel width, not a fixed character count, so wide and narrow character names both fit correctly instead of some overflowing while others get cut short unnecessarily.
+If any XP milestone roles are configured (see "XP milestone roles" below), the card also shows how much XP is needed for the next one not yet reached — e.g. "4,784 XP to Gold". Rank #1 gets a gold star and gold-accented rank text regardless of banner tier, so the top spot always stands out. Rank text otherwise uses a brightened, boosted-saturation version of the tier's primary color — the raw color looks great as a thick border/ring, but some colors (dark, muted ones especially) are too hard to read comfortably as plain text against the card's dark background, so text specifically gets a readability boost while the border, ring, and progress bar keep the true color. The card is drawn at high internal resolution and downscaled for smooth, anti-aliased edges rather than the jagged look raw drawing would otherwise produce, then shipped at 1560×600 — a higher native resolution than the card's actual design size, so it still looks sharp in Discord's small inline chat preview rather than blurry. Long display names are truncated based on actual rendered pixel width, not a fixed character count, so wide and narrow character names both fit correctly instead of some overflowing while others get cut short unnecessarily, and truncation leaves extra room automatically when a tier badge (below) is also on the card, so the two never overlap.
+
+**If a member holds a banner tier, its name appears as a small colored badge in the top-right corner** (e.g. "SUPPORTER", "ELITE") — pulled straight from the `name` you gave it in `/addbannertier`, colored with the tier's own primary color, with the badge's text automatically flipped between near-black and near-white depending on which reads better against that particular color.
+
+**Self-serve color picker** — if you're looking at your own card and don't hold a banner tier (tiered looks are fixed by the tier, not something to pick), a dropdown appears under the card letting you pick from the same preset palette `/setbordercolor` uses. Picking one updates your card in place immediately. This is the free/no-purchase-required customization path; it disappears once you hold a tier role, since the tier's color takes over at that point.
 
 The rank-1 star and the rank-change up/down indicators are drawn as actual shapes, not Unicode symbol characters (★/▲/▼) — Windows' Arial, a common fallback font, doesn't reliably include those glyph blocks, which could make them silently fail to render (or show as a blank box) depending on what font the host has available. Drawing them as vector shapes instead means they always render correctly regardless of platform or installed fonts.
 
@@ -329,7 +339,7 @@ Each tier ties a **profile banner look** to a Discord role — the intended flow
 Three modes:
 - **`solid`** — one flat color (`color1`), same as a classic border color.
 - **`gradient`** — a two-color sweep across the background, border, avatar ring, and progress bar fill, from `color1` (left) to `color2` (right, required for this mode). All four elements pull from the exact same gradient image, so they always stay in sync rather than each being tinted separately.
-- **`rainbow`** — the border and background slowly cycle through the full hue wheel, starting from `color1`, as an animated GIF. This is intentionally the most premium-looking option — reserve it for your top tier. A full color cycle takes a little over 4 seconds; it's deliberately slow and smooth rather than fast, since rapid color cycling reads as flashing and can be uncomfortable for motion/light-sensitive members.
+- **`rainbow`** — the border outline, avatar ring, and progress-bar fill slowly cycle through the full hue wheel, starting from `color1`, as an animated GIF; the background stays a fixed dark gray rather than tinting along with it. This is intentionally the most premium-looking option — reserve it for your top tier. A full color cycle takes a little over 4 seconds; it's deliberately slow and smooth rather than fast, since rapid color cycling reads as flashing and can be uncomfortable for motion/light-sensitive members. Keeping the background and text fixed and only animating the border/ring/bar isn't just a style choice — a GIF shares one 256-color palette across every frame, so the less of the card that's actually changing color, the more of that budget goes into a smooth border sweep instead of being spread thin across a full-card gradient and showing up as visible banding or noise.
 
 If a member holds roles for more than one tier (e.g. they kept an old role after upgrading), `priority` decides which one wins — higher number = more premium, and only the single highest one is ever shown, never a blend. Set it however you like; it just needs to be higher for the tiers you consider more valuable. `/listbannertiers` shows everything currently configured, highest priority first. `/removebannertier` takes a tier away from a role.
 

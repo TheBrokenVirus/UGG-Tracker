@@ -960,6 +960,21 @@ def _readable_text_variant(rgb: tuple, min_lightness: float = 0.62, min_saturati
     r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
     return (int(r2 * 255), int(g2 * 255), int(b2 * 255), 255)
 
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return (int(r2 * 255), int(g2 * 255), int(b2 * 255), 255)
+
+def _contrast_text_color(rgb: tuple) -> tuple:
+    """Near-black or near-white, whichever reads better on top of the
+    given color — for text sitting directly ON a colored fill (like the
+    tier badge pill), which is a different problem than
+    _readable_text_variant (text sitting on the card's fixed dark
+    background instead). Uses perceived luminance, not just raw
+    brightness, since human eyes read green as much brighter than blue
+    at the same numeric value."""
+    r, g, b = rgb[:3]
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return (24, 24, 27, 255) if luminance > 0.6 else (248, 249, 250, 255)
+
 def _star_points(cx: float, cy: float, outer_r: float, inner_r: float, points: int = 5) -> list:
     """Vertex list for a filled 5-pointed star, for draw.polygon(). Used
     instead of the ★ Unicode character, since Windows' Arial (a common
@@ -1052,15 +1067,20 @@ def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
     return daily_rank - current_rank
 
 # Animated profile cards: a full hue rotation happens over roughly
-# ANIMATED_PROFILE_FRAMES * ANIMATED_PROFILE_FRAME_MS milliseconds (26 * 160
-# ≈ 4.2s per loop) — slow and smooth is intentional, since a fast color
+# ANIMATED_PROFILE_FRAMES * ANIMATED_PROFILE_FRAME_MS milliseconds (52 * 105
+# ≈ 5.5s per loop) — slow and smooth is intentional, since a fast color
 # cycle reads as flashing/strobing rather than a nice glow, and could be
-# uncomfortable for motion/light-sensitive users. Rendered at a lower
-# supersampling factor than the static card (3x vs 5x) since it's paid
-# for once per frame instead of once total — still enough headroom for
-# clean edges after the downscale to FINAL_W/FINAL_H.
-ANIMATED_PROFILE_FRAMES = 26
-ANIMATED_PROFILE_FRAME_MS = 160
+# uncomfortable for motion/light-sensitive users. Frame count is doubled
+# from the original 26 for a finer hue step between frames — affordable
+# because only the border/ring/bar-fill actually differ frame to frame
+# (see render_solid_frame's tint_background=False path below); the
+# background and text staying byte-identical keeps each extra frame
+# cheap to add to the GIF instead of scaling the file size linearly.
+# Rendered at a lower supersampling factor than the static card (3x vs
+# 5x) since it's paid for once per frame instead of once total — still
+# enough headroom for clean edges after the downscale to FINAL_W/FINAL_H.
+ANIMATED_PROFILE_FRAMES = 52
+ANIMATED_PROFILE_FRAME_MS = 105
 ANIMATED_PROFILE_SCALE = 3
 STATIC_PROFILE_SCALE = 5
 
@@ -1123,9 +1143,9 @@ async def build_profile_card(
     if mode == "rainbow" and not animation_allowed:
         mode = "solid"  # accessibility/bandwidth override — see docstring
 
-    FINAL_W, FINAL_H = 1350, 510
+    FINAL_W, FINAL_H = 1560, 600
     SCALE = ANIMATED_PROFILE_SCALE if mode == "rainbow" else STATIC_PROFILE_SCALE
-    CARD_W, CARD_H = 900 * SCALE, 340 * SCALE
+    CARD_W, CARD_H = 1040 * SCALE, 400 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
     WHITE = (245, 246, 248, 255)
@@ -1146,7 +1166,7 @@ async def build_profile_card(
     # Everything that doesn't depend on the border color is computed once,
     # up front, and reused across every frame (there's only ever one frame
     # for a static card) — masks, fonts, avatar resize, and text layout.
-    avatar_size = 220 * SCALE
+    avatar_size = 240 * SCALE
     avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
     avatar_resized = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
     avatar_mask = Image.new("L", (avatar_size, avatar_size), 0)
@@ -1162,19 +1182,25 @@ async def build_profile_card(
     grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
 
     text_x = 35 * SCALE + avatar_size + 45 * SCALE
-    font_name = _find_profile_font(True, 44 * SCALE)
-    font_rank = _find_profile_font(True, 29 * SCALE)
-    font_change = _find_profile_font(True, 21 * SCALE)
-    font_stat_label = _find_profile_font(False, 19 * SCALE)
-    font_stat_value = _find_profile_font(True, 28 * SCALE)
-    font_bar_label = _find_profile_font(False, 15 * SCALE)
+    font_name = _find_profile_font(True, 52 * SCALE)
+    font_rank = _find_profile_font(True, 34 * SCALE)
+    font_change = _find_profile_font(True, 24 * SCALE)
+    font_stat_label = _find_profile_font(False, 22 * SCALE)
+    font_stat_value = _find_profile_font(True, 34 * SCALE)
+    font_bar_label = _find_profile_font(False, 17 * SCALE)
+    font_badge = _find_profile_font(True, 20 * SCALE)
 
-    max_name_width = CARD_W - text_x - 40 * SCALE  # same right margin used by the bar/stats below
+    # A tier badge (see _draw_body) sits in the top-right corner when a
+    # banner tier applies — reserve extra width so a long display name
+    # truncates before it would run under the badge, instead of the two
+    # overlapping.
+    badge_reserve = 170 * SCALE if (banner is not None and banner.get("name")) else 0
+    max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
     _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     display_name = _fit_text_to_width(_measure_draw, member.display_name, font_name, max_name_width)
 
-    bar_x, bar_y = text_x, 296 * SCALE
-    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 24 * SCALE
+    bar_x, bar_y = text_x, 340 * SCALE
+    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 26 * SCALE
     effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
     pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
     fill_w = max(int(bar_w * pct), bar_h) if pct > 0 else 0
@@ -1184,15 +1210,32 @@ async def build_profile_card(
 
     def _draw_body(card: "Image.Image", draw: "ImageDraw.ImageDraw", rank_text_rgb: tuple):
         """Everything that isn't the background/border/bar fill — avatar,
-        name, rank, milestone text, stats. Identical across every mode."""
-        draw.text((text_x, 46 * SCALE), display_name, font=font_name, fill=WHITE)
+        name, rank, milestone text, stats, tier badge. Identical across
+        every mode."""
+        draw.text((text_x, 44 * SCALE), display_name, font=font_name, fill=WHITE)
 
-        rank_y = 118 * SCALE
+        if banner is not None and banner.get("name"):
+            badge_text = banner["name"].upper()
+            badge_bg = _hex_to_rgb(banner["color1"]) + (255,)
+            badge_fg = _contrast_text_color(badge_bg)
+            pad_x, pad_y = 16 * SCALE, 8 * SCALE
+            text_w = draw.textlength(badge_text, font=font_badge)
+            badge_h = 20 * SCALE + pad_y * 2
+            badge_w = text_w + pad_x * 2
+            badge_x2 = CARD_W - 26 * SCALE
+            badge_x1 = badge_x2 - badge_w
+            badge_y1 = 26 * SCALE
+            draw.rounded_rectangle(
+                [badge_x1, badge_y1, badge_x2, badge_y1 + badge_h], radius=badge_h / 2, fill=badge_bg,
+            )
+            draw.text((badge_x1 + pad_x, badge_y1 + pad_y), badge_text, font=font_badge, fill=badge_fg)
+
+        rank_y = 132 * SCALE
         rank_text_x = text_x
         if rank == 1:
-            star_outer_r = 12 * SCALE
+            star_outer_r = 13 * SCALE
             star_cx = text_x + star_outer_r
-            star_cy = rank_y + 17 * SCALE
+            star_cy = rank_y + 19 * SCALE
             draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
             rank_text_x = text_x + star_outer_r * 2 + 10 * SCALE
 
@@ -1201,52 +1244,71 @@ async def build_profile_card(
 
         if rank_change is not None:
             badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
-            badge_cy = rank_y + 19 * SCALE
+            badge_cy = rank_y + 21 * SCALE
             if rank_change > 0:
-                draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
-                draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
+                draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
+                draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
             elif rank_change < 0:
-                draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
-                draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
+                draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
+                draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
             else:
                 draw.rounded_rectangle(
-                    [badge_x, badge_cy - 3 * SCALE, badge_x + 16 * SCALE, badge_cy + 3 * SCALE],
+                    [badge_x, badge_cy - 3 * SCALE, badge_x + 18 * SCALE, badge_cy + 3 * SCALE],
                     radius=3 * SCALE, fill=MUTED_TEXT,
                 )
 
         if next_milestone:
             needed, role_name = next_milestone
-            milestone_font = _find_profile_font(False, 17 * SCALE)
+            milestone_font = _find_profile_font(False, 19 * SCALE)
             draw.text(
-                (text_x, 156 * SCALE), f"{needed:,} XP to {role_name}",
+                (text_x, 178 * SCALE), f"{needed:,} XP to {role_name}",
                 font=milestone_font, fill=MUTED_TEXT,
             )
 
-        stat_y = 200 * SCALE
+        stat_y = 230 * SCALE
         draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
-        draw.text((text_x, stat_y + 28 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
+        draw.text((text_x, stat_y + 32 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
 
-        stat_x2 = text_x + 290 * SCALE
+        stat_x2 = text_x + 330 * SCALE
         draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
         week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
-        draw.text((stat_x2, stat_y + 28 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+        draw.text((stat_x2, stat_y + 32 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
 
-        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=12 * SCALE, fill=BAR_BG)
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=13 * SCALE, fill=BAR_BG)
         draw.text(
-            (bar_x, bar_y - 24 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
+            (bar_x, bar_y - 28 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
             font=font_bar_label, fill=MUTED_TEXT,
         )
 
-    def render_solid_frame(border_rgb: tuple) -> "Image.Image":
+    def render_solid_frame(
+        border_rgb: tuple, tint_background: bool = True, rank_text_override: Optional[tuple] = None,
+    ) -> "Image.Image":
         """Draws one full card in a single solid color and returns it
         already downscaled to FINAL_W/FINAL_H. Used for the "solid" mode
-        (once) and "rainbow" mode (once per hue-rotated frame)."""
-        rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
+        (once) and "rainbow" mode (once per hue-rotated frame).
 
-        tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
-        bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
-        bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
-        bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+        For the animated rainbow path, tint_background=False keeps the
+        background a flat, unchanging dark gray instead of tinting it
+        toward the rotating hue, and rank_text_override holds the rank
+        text at one fixed color instead of shifting every frame — only
+        the border outline, avatar ring, and progress-bar fill actually
+        rotate. This isn't just a style choice: a GIF's whole animation
+        shares one 256-color palette, so the smaller the area that
+        actually changes color frame-to-frame, the more of that budget
+        is available for a smooth hue sweep on the part that matters,
+        instead of it being spent thinly across a full-card gradient and
+        showing up as visible banding."""
+        rank_text_rgb = rank_text_override if rank_text_override is not None else (
+            GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
+        )
+
+        if tint_background:
+            tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
+            bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
+            bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
+            bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+        else:
+            bg_gradient = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
 
         card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
         card.paste(bg_gradient, (0, 0), corner_mask)
@@ -1265,7 +1327,7 @@ async def build_profile_card(
 
         _draw_body(card, draw, rank_text_rgb)
         if fill_w:
-            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=12 * SCALE, fill=border_rgb)
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=13 * SCALE, fill=border_rgb)
 
         return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
 
@@ -1313,7 +1375,7 @@ async def build_profile_card(
         if fill_w:
             bar_mask = Image.new("L", (CARD_W, CARD_H), 0)
             ImageDraw.Draw(bar_mask).rounded_rectangle(
-                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=12 * SCALE, fill=255,
+                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=13 * SCALE, fill=255,
             )
             card.paste(color_gradient, (0, 0), bar_mask)
 
@@ -1321,40 +1383,85 @@ async def build_profile_card(
 
     buf = io.BytesIO()
 
+    # PNG supports real alpha, so the rounded-rect corner_mask clip (which
+    # leaves fully transparent pixels outside the card's rounded corners)
+    # comes through correctly as-is — no flattening needed. Converting to
+    # RGB here would have dropped alpha and left those corners as solid
+    # black squares instead of see-through rounded corners.
     if mode == "gradient" and color2_rgb is not None:
-        frame = render_gradient_frame(color1_rgb, color2_rgb).convert("RGB")
+        frame = render_gradient_frame(color1_rgb, color2_rgb)
         frame.save(buf, format="PNG")
         buf.seek(0)
         return buf
 
     if mode != "rainbow":
-        frame = render_solid_frame(color1_rgb).convert("RGB")
+        frame = render_solid_frame(color1_rgb)
         frame.save(buf, format="PNG")
         buf.seek(0)
         return buf
 
-    frames = [
-        render_solid_frame(_rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES))).convert("RGB")
+    fixed_rank_text = GOLD_ACCENT if rank == 1 else _readable_text_variant(color1_rgb)
+    frames_rgba = [
+        render_solid_frame(
+            _rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES)),
+            tint_background=False, rank_text_override=fixed_rank_text,
+        )
         for i in range(ANIMATED_PROFILE_FRAMES)
     ]
 
-    # GIF frames each need a palette. Quantizing every frame independently
-    # would let each one pick slightly different colors and flicker; instead
-    # a handful of frames spread across the full hue cycle are combined into
-    # one strip and quantized together, and every frame is then mapped onto
-    # that one shared palette so colors stay consistent frame-to-frame.
-    sample_count = min(8, len(frames))
-    sample_step = max(len(frames) // sample_count, 1)
-    strip_samples = frames[::sample_step][:sample_count]
-    strip = Image.new("RGB", (strip_samples[0].width * len(strip_samples), strip_samples[0].height))
-    for i, sample in enumerate(strip_samples):
-        strip.paste(sample, (i * sample.width, 0))
+    # GIF has no real alpha channel — only one palette color can be marked
+    # "transparent" per frame. Plainly converting the RGBA frames above to
+    # RGB would turn the rounded corners (currently fully transparent, alpha
+    # 0) into solid black squares, since dropping alpha just keeps the
+    # underlying R/G/B values as-is. Instead, every pixel below the alpha
+    # threshold gets overwritten with one reserved sentinel color first —
+    # chosen to be nothing else in the card ever produces — so it survives
+    # quantization as its own palette entry, and that entry is then marked
+    # as the transparent index when saving. This does mean the rounded
+    # corner's edge is a hard cutoff rather than smoothly anti-aliased
+    # (GIF transparency is binary, on or off) — some jaggedness right at
+    # the curve is an inherent GIF limitation, not a bug, but it's only a
+    # couple of pixels wide thanks to the supersampled render.
+    CORNER_KEY_RGB = (1, 2, 3)
+
+    def _flatten_with_transparency_key(rgba_frame: "Image.Image") -> "Image.Image":
+        alpha = rgba_frame.split()[3]
+        rgb = rgba_frame.convert("RGB")
+        transparent_mask = alpha.point(lambda a: 255 if a < 128 else 0)
+        rgb.paste(Image.new("RGB", rgba_frame.size, CORNER_KEY_RGB), mask=transparent_mask)
+        return rgb
+
+    frames = [_flatten_with_transparency_key(f) for f in frames_rgba]
+
+    # GIF frames all need to share one 256-color palette — quantizing each
+    # frame independently would let every frame pick slightly different
+    # colors and flicker. The palette is built from every frame (not just
+    # a handful) so it actually covers the full hue rotation rather than
+    # banding on frames that weren't sampled, and dithering is turned OFF:
+    # Floyd-Steinberg dithering is randomized per frame, so on an
+    # animation it doesn't look like smooth shading — it looks like
+    # static/noise crawling over the card as frames change. A flat
+    # nearest-color match keeps every frame visually stable; the palette
+    # being well-covered is what keeps that from banding badly. Each frame
+    # contributes a small thumbnail rather than its full-resolution self —
+    # same color distribution for palette purposes, far less work.
+    thumb_w, thumb_h = 160, int(160 * frames[0].height / frames[0].width)
+    strip = Image.new("RGB", (thumb_w * len(frames), thumb_h))
+    for i, frame in enumerate(frames):
+        strip.paste(frame.resize((thumb_w, thumb_h), Image.BILINEAR), (i * thumb_w, 0))
     shared_palette = strip.quantize(colors=256, method=Image.MEDIANCUT)
 
-    quantized = [f.quantize(palette=shared_palette, dither=Image.FLOYDSTEINBERG) for f in frames]
+    # Whichever palette index the sentinel color landed on is what gets
+    # marked transparent — found by running it through the same palette
+    # rather than assumed, since MEDIANCUT's exact index assignment isn't
+    # something to hardcode.
+    key_probe = Image.new("RGB", (1, 1), CORNER_KEY_RGB).quantize(palette=shared_palette, dither=Image.NONE)
+    transparent_index = key_probe.getpixel((0, 0))
+
+    quantized = [f.quantize(palette=shared_palette, dither=Image.NONE) for f in frames]
     quantized[0].save(
         buf, format="GIF", save_all=True, append_images=quantized[1:],
-        duration=ANIMATED_PROFILE_FRAME_MS, loop=0, disposal=2,
+        duration=ANIMATED_PROFILE_FRAME_MS, loop=0, disposal=2, transparency=transparent_index,
     )
     buf.seek(0)
     return buf
@@ -2263,6 +2370,7 @@ SETTINGS_CATEGORIES = [
     ("requirement_week", "Requirement & Week", "⏱️", "Weekly XP goal, syncing everyone's week, proration"),
     ("display", "Display", "🎨", "Recent rate, compact leaderboard, pagination"),
     ("roles", "XP Roles", "🏅", "Milestone roles tied to XP thresholds"),
+    ("banners", "Banner Tiers", "🎗️", "Profile card colors, animation, and badge text per role"),
     ("automation", "Channels & Automation", "📢", "Tracking channel, announcements, schedules, pings"),
     ("store", "Store", "🛒", "Store link and product menu for /store"),
     ("danger", "Danger Zone", "⚠️", "Bulk-remove tracked users"),
@@ -2415,6 +2523,170 @@ class RolesSettingsView(discord.ui.View):
             f"Re-checked **{checked}** member(s). Added **{added_count}**, removed **{removed_count}**.",
             ephemeral=True,
         )
+
+
+class BannerTierModal(discord.ui.Modal, title="Configure Banner Tier"):
+    tier_name = discord.ui.TextInput(label="Tier name (shown as the badge on /profile)", placeholder="e.g. Supporter", max_length=20)
+    mode = discord.ui.TextInput(label="Mode: solid, gradient, or rainbow", placeholder="solid", max_length=10)
+    color1 = discord.ui.TextInput(label="Primary color (hex)", placeholder="#FF5733", max_length=7)
+    color2 = discord.ui.TextInput(
+        label="Second color (hex) — gradient mode only", placeholder="#3498DB", required=False, max_length=7,
+    )
+    priority = discord.ui.TextInput(label="Priority (higher = more premium)", placeholder="1", max_length=5)
+
+    def __init__(self, guild_id: int, role: discord.Role, existing: Optional[dict] = None):
+        super().__init__()
+        self.guild_id = guild_id
+        self.role = role
+        if existing:
+            self.tier_name.default = existing["name"]
+            self.mode.default = existing["mode"]
+            self.color1.default = existing["color1"]
+            self.color2.default = existing.get("color2") or ""
+            self.priority.default = str(existing["priority"])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        mode_value = self.mode.value.strip().lower()
+        if mode_value not in ("solid", "gradient", "rainbow"):
+            await interaction.response.send_message(
+                "Mode must be exactly `solid`, `gradient`, or `rainbow`.", ephemeral=True,
+            )
+            return
+
+        hex1 = _parse_hex_color(self.color1.value)
+        if hex1 is None:
+            await interaction.response.send_message(
+                f"`{self.color1.value}` doesn't look like a valid hex color — use a format like `#FF5733`.",
+                ephemeral=True,
+            )
+            return
+
+        hex2 = None
+        color2_raw = self.color2.value.strip()
+        if mode_value == "gradient":
+            if not color2_raw:
+                await interaction.response.send_message(
+                    "Gradient mode needs a second color — that's the color it sweeps into.", ephemeral=True,
+                )
+                return
+            hex2 = _parse_hex_color(color2_raw)
+            if hex2 is None:
+                await interaction.response.send_message(
+                    f"`{color2_raw}` doesn't look like a valid hex color — use a format like `#FF5733`.",
+                    ephemeral=True,
+                )
+                return
+        elif color2_raw:
+            hex2 = _parse_hex_color(color2_raw)  # stored but unused outside gradient mode; validate anyway if given
+
+        try:
+            priority_value = int(self.priority.value.strip())
+        except ValueError:
+            await interaction.response.send_message("Priority must be a whole number.", ephemeral=True)
+            return
+
+        name_value = self.tier_name.value.strip()
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        tiers = guild_data.setdefault("banner_tiers", [])
+        tiers[:] = [t for t in tiers if t["role_id"] != self.role.id]
+        tiers.append({
+            "role_id": self.role.id, "name": name_value, "mode": mode_value,
+            "color1": hex1, "color2": hex2, "priority": priority_value,
+        })
+        save_data(data)
+
+        mode_desc = {"solid": hex1, "gradient": f"{hex1} → {hex2}", "rainbow": f"animated, starting at {hex1}"}[mode_value]
+        await log_admin_action(
+            interaction.guild, guild_data, interaction.user, "Configured banner tier (settings panel)",
+            target=self.role.mention, details=f"{name_value} — {mode_value} ({mode_desc})",
+        )
+        await interaction.response.send_message(
+            f"Banner tier **{name_value}** saved for {self.role.mention} — {mode_value} ({mode_desc}). "
+            f"The top-right badge on their `/profile` card will show \"{name_value.upper()}\".",
+            ephemeral=True,
+        )
+
+
+class AddBannerTierRoleSelectView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Choose a role to configure a banner tier for")
+    async def select_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role = select.values[0]
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        existing = next((t for t in get_banner_tiers(guild_data) if t["role_id"] == role.id), None)
+        await interaction.response.send_modal(BannerTierModal(self.guild_id, role, existing))
+
+
+class RemoveBannerTierRoleSelectView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Choose a role to remove its banner tier")
+    async def select_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role = select.values[0]
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        tiers = guild_data.setdefault("banner_tiers", [])
+        before = len(tiers)
+        tiers[:] = [t for t in tiers if t["role_id"] != role.id]
+        save_data(data)
+        if len(tiers) < before:
+            await interaction.response.send_message(f"Removed the banner tier for {role.mention}.", ephemeral=True)
+        else:
+            await interaction.response.send_message("That role doesn't have a banner tier configured.", ephemeral=True)
+
+
+class BannerTiersSettingsView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
+
+    @discord.ui.button(label="Add / Edit Tier", style=discord.ButtonStyle.primary, emoji="🎗️")
+    async def add_tier(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = AddBannerTierRoleSelectView(self.guild_id)
+        await interaction.response.send_message(
+            "Select a role to configure — picking a role that already has a tier opens it pre-filled, so you "
+            "can just edit and resave (e.g. to rename what the badge on `/profile` shows):",
+            view=view, ephemeral=True,
+        )
+
+    @discord.ui.button(label="Remove Tier", style=discord.ButtonStyle.secondary, emoji="🗑️")
+    async def remove_tier(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = RemoveBannerTierRoleSelectView(self.guild_id)
+        await interaction.response.send_message("Select a role to remove its banner tier:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="List Tiers", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def list_tiers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        tiers = get_banner_tiers(guild_data)
+        if not tiers:
+            await interaction.response.send_message("No banner tiers configured yet.", ephemeral=True)
+            return
+        lines = []
+        for tier in reversed(tiers):  # highest priority first
+            role_mention = f"<@&{tier['role_id']}>"
+            if tier["mode"] == "solid":
+                look = tier["color1"]
+            elif tier["mode"] == "gradient":
+                look = f"{tier['color1']} → {tier['color2']}"
+            else:
+                look = f"animated, starting at {tier['color1']}"
+            lines.append(f"**{tier['name']}** (priority {tier['priority']}) — {role_mention} — {tier['mode']}: {look}")
+        embed = discord.Embed(
+            title="🎗️ Profile Banner Tiers", description="\n".join(lines), color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class StoreURLModal(discord.ui.Modal, title="Set Store URL"):
@@ -2642,6 +2914,8 @@ def build_settings_category_view(category: str, guild_id: int, guild_data: dict)
         )
     if category == "roles":
         return RolesSettingsView(guild_id)
+    if category == "banners":
+        return BannerTiersSettingsView(guild_id)
     if category == "automation":
         return AutomationSettingsView(guild_id, inactivity_includes_behind_pace(guild_data))
     if category == "store":
@@ -3401,6 +3675,87 @@ async def progresschart(interaction: discord.Interaction, user: Optional[discord
     await interaction.followup.send(embed=embed, file=file)
 
 
+async def _render_member_profile(guild: discord.Guild, guild_data: dict, member: discord.Member) -> tuple:
+    """Shared by /profile and the self-serve color picker below: computes
+    rank, stats, next milestone, and banner tier for a member, then
+    renders their card. Returns (BytesIO, filename, banner) — banner is
+    handed back too so the caller can decide whether a customize panel
+    makes sense (only when the member holds no tier, since a tier's look
+    is fixed by design, not something to pick from a dropdown)."""
+    entry = guild_data["users"][str(member.id)]
+    ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
+    rank = next((i + 1 for i, (uid, _) in enumerate(ranked) if uid == str(member.id)), len(ranked))
+    total_members = len(ranked)
+    stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+
+    next_milestone = None
+    exclusive_roles = [m for m in get_xp_roles(guild_data) if m["exclusive"] and m["xp"] > entry["current_xp"]]
+    if exclusive_roles:
+        next_mapping = exclusive_roles[0]  # get_xp_roles() returns them sorted ascending
+        role_obj = guild.get_role(next_mapping["role_id"])
+        role_name = role_obj.name if role_obj else "the next tier"
+        next_milestone = (next_mapping["xp"] - entry["current_xp"], role_name)
+
+    rank_change = get_rank_change(entry, rank)
+    animation_allowed = get_animated_profiles_enabled(guild_data)
+    banner = get_member_banner_tier(guild_data, member)
+
+    card_buf = await build_profile_card(
+        member, entry, stats, guild_data["requirement"], rank, total_members,
+        next_milestone=next_milestone, rank_change=rank_change,
+        banner=banner, animation_allowed=animation_allowed,
+    )
+    will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
+    filename = "profile.gif" if will_animate else "profile.png"
+    return card_buf, filename, banner
+
+
+class ProfileColorSelect(discord.ui.Select):
+    """A dropdown of the preset border colors, attached to a member's own
+    /profile card when they hold no banner tier — tiered looks are fixed
+    by the tier (see /addbannertier), but the free/default look is still
+    self-serve rather than admin-only."""
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, value=hex_val, description=hex_val, emoji="🎨")
+            for name, hex_val in PRESET_BORDER_COLORS.items()
+        ]
+        super().__init__(placeholder="🎨 Change your border color…", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "ProfileCustomizeView" = self.view
+        if interaction.user.id != view.target_id:
+            await interaction.response.send_message("Only the profile's owner can change this.", ephemeral=True)
+            return
+
+        data = load_data()
+        guild_data = get_guild(data, view.guild_id)
+        entry = guild_data["users"].get(str(view.target_id))
+        if entry is None:
+            await interaction.response.send_message("No tracking data found — try `/checkin` first.", ephemeral=True)
+            return
+
+        entry["border_color"] = self.values[0]
+
+        member = interaction.guild.get_member(view.target_id) or await interaction.guild.fetch_member(view.target_id)
+        card_buf, filename, banner = await _render_member_profile(interaction.guild, guild_data, member)
+        save_data(data)  # persists the color change plus any lazy rollover triggered inside the helper above
+        # If a tier now applies (e.g. a role was added mid-session) the
+        # picker no longer makes sense — drop it rather than leave a
+        # dropdown that would silently do nothing useful.
+        new_view = view if banner is None else None
+        file = discord.File(fp=card_buf, filename=filename)
+        await interaction.response.edit_message(attachments=[file], view=new_view)
+
+
+class ProfileCustomizeView(discord.ui.View):
+    def __init__(self, guild_id: int, target_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.target_id = target_id
+        self.add_item(ProfileColorSelect())
+
+
 @bot.tree.command(name="profile", description="Show a profile card with your (or someone else's) Crew XP, rank, and border color")
 @app_commands.describe(user="User to show (defaults to you)")
 @require_tracking_channel()
@@ -3427,36 +3782,15 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
 
     await interaction.response.defer(thinking=True)
 
-    # Rank by actual total XP, same ordering as /totalleaderboard
-    ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
-    rank = next((i + 1 for i, (uid, _) in enumerate(ranked) if uid == str(target.id)), len(ranked))
-    total_members = len(ranked)
-
-    stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
-    save_data(data)  # persist any lazy rollover triggered by compute_stats
-
-    # Find the next un-reached exclusive-ladder XP role, if any are configured
-    next_milestone = None
-    exclusive_roles = [m for m in get_xp_roles(guild_data) if m["exclusive"] and m["xp"] > entry["current_xp"]]
-    if exclusive_roles:
-        next_mapping = exclusive_roles[0]  # get_xp_roles() returns them sorted ascending
-        role_obj = interaction.guild.get_role(next_mapping["role_id"])
-        role_name = role_obj.name if role_obj else "the next tier"
-        next_milestone = (next_mapping["xp"] - entry["current_xp"], role_name)
-
-    rank_change = get_rank_change(entry, rank)
-    animation_allowed = get_animated_profiles_enabled(guild_data)
-    banner = get_member_banner_tier(guild_data, target)
-
-    card_buf = await build_profile_card(
-        target, entry, stats, guild_data["requirement"], rank, total_members,
-        next_milestone=next_milestone, rank_change=rank_change,
-        banner=banner, animation_allowed=animation_allowed,
-    )
-    will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
-    filename = "profile.gif" if will_animate else "profile.png"
+    card_buf, filename, banner = await _render_member_profile(interaction.guild, guild_data, target)
+    save_data(data)  # persist any lazy rollover triggered by compute_stats inside the helper above
     file = discord.File(fp=card_buf, filename=filename)
-    await interaction.followup.send(file=file)
+
+    # The customize panel only makes sense for your own card, and only
+    # when no tier applies — a tier's look is fixed by design (see
+    # /addbannertier), so there's nothing to pick from a dropdown there.
+    view = ProfileCustomizeView(interaction.guild_id, target.id) if (target.id == interaction.user.id and banner is None) else None
+    await interaction.followup.send(file=file, view=view)
 
 
 @bot.tree.command(name="undo", description="Remove the most recent checkin (yours, or someone else's if you're an admin)")
