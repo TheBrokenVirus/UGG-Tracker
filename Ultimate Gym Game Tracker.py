@@ -1143,9 +1143,9 @@ async def build_profile_card(
     if mode == "rainbow" and not animation_allowed:
         mode = "solid"  # accessibility/bandwidth override — see docstring
 
-    FINAL_W, FINAL_H = 1560, 600
+    FINAL_W, FINAL_H = 1560, 630
     SCALE = ANIMATED_PROFILE_SCALE if mode == "rainbow" else STATIC_PROFILE_SCALE
-    CARD_W, CARD_H = 1040 * SCALE, 400 * SCALE
+    CARD_W, CARD_H = 1040 * SCALE, 420 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
     WHITE = (245, 246, 248, 255)
@@ -1185,9 +1185,9 @@ async def build_profile_card(
     font_name = _find_profile_font(True, 52 * SCALE)
     font_rank = _find_profile_font(True, 34 * SCALE)
     font_change = _find_profile_font(True, 24 * SCALE)
-    font_stat_label = _find_profile_font(False, 22 * SCALE)
+    font_stat_label = _find_profile_font(False, 23 * SCALE)
     font_stat_value = _find_profile_font(True, 34 * SCALE)
-    font_bar_label = _find_profile_font(False, 17 * SCALE)
+    font_bar_label = _find_profile_font(False, 23 * SCALE)
     font_badge = _find_profile_font(True, 20 * SCALE)
 
     # A tier badge (see _draw_body) sits in the top-right corner when a
@@ -1199,8 +1199,8 @@ async def build_profile_card(
     _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     display_name = _fit_text_to_width(_measure_draw, member.display_name, font_name, max_name_width)
 
-    bar_x, bar_y = text_x, 340 * SCALE
-    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 26 * SCALE
+    bar_x, bar_y = text_x, 362 * SCALE
+    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 28 * SCALE
     effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
     pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
     fill_w = max(int(bar_w * pct), bar_h) if pct > 0 else 0
@@ -1274,9 +1274,9 @@ async def build_profile_card(
         week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
         draw.text((stat_x2, stat_y + 32 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
 
-        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=13 * SCALE, fill=BAR_BG)
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=14 * SCALE, fill=BAR_BG)
         draw.text(
-            (bar_x, bar_y - 28 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
+            (bar_x, bar_y - 34 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
             font=font_bar_label, fill=MUTED_TEXT,
         )
 
@@ -1327,7 +1327,7 @@ async def build_profile_card(
 
         _draw_body(card, draw, rank_text_rgb)
         if fill_w:
-            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=13 * SCALE, fill=border_rgb)
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=border_rgb)
 
         return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
 
@@ -1375,7 +1375,7 @@ async def build_profile_card(
         if fill_w:
             bar_mask = Image.new("L", (CARD_W, CARD_H), 0)
             ImageDraw.Draw(bar_mask).rounded_rectangle(
-                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=13 * SCALE, fill=255,
+                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=255,
             )
             card.paste(color_gradient, (0, 0), bar_mask)
 
