@@ -90,7 +90,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/setinactivitythreshold days: hours: minutes:` | Admin | How long before week-end the inactivity ping fires (default: 24 hours). |
 | `/toggleleaderboardpagination enabled:<true/false>` | Admin | Switch leaderboards between Previous/Next paging and the default single truncated embed. |
 | `/setbaseline user:<@user> starting_xp:<number>` | Admin | Set or correct someone's all-time starting XP — this is what `/totalleaderboard` calculates total gain from. |
-| `/importxp file:<.csv or .xlsx> [overwrite]` | Admin | Bulk-set starting XP for many users at once from a spreadsheet. See below. |
+| `/importxp file:<.csv or .xlsx> [existing_users]` | Admin | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. See below. |
 | `/fullreset user:<@user> [clear_history]` | Admin | Reset **both** weekly and all-time totals at once, starting fresh from their current XP. `clear_history: true` (default) also wipes their stored checkin history. Unlike `/removeuser`, they stay registered — no need to re-checkin to restart tracking. |
 | `/resetweek user:<@user>` | Admin | Manually restart someone's weekly window right now (0 days elapsed). |
 | `/setweekprogress user:<@user> [days] [hours] [minutes] [week_start_xp]` | Admin | Manually set how far into the week someone is, in plain days/hours/minutes (e.g. `days: 3, hours: 12` treats them as if their week started 3.5 days ago). Optionally also override their starting XP for the week. |
@@ -154,7 +154,12 @@ You only need `discord_id` **or** `username` per row, not both — `discord_id` 
 
 > ⚠️ **If you use `discord_id`**: format that column as **Text**, not a number, before typing IDs into it (in Google Sheets/Excel: select the column → Format → Number → Plain text). Discord IDs are 17-19 digits long, which exceeds what a spreadsheet numeric cell can store exactly — as a real number, the last few digits can get silently rounded off, corrupting the ID. This doesn't affect the `username` column, which is plain text either way — if you're not sure, skip `discord_id` entirely and just use `username`.
 
-**3. Run `/importxp`** and attach the file. By default, anyone already being tracked is **skipped** (not overwritten) — pass `overwrite: true` if you want the spreadsheet to replace their existing data instead (this acts like `/fullreset` combined with `/setbaseline` for that person).
+**3. Run `/importxp`**, attach the file, and choose what to do with anyone already tracked via `existing_users`:
+- **Skip** (default) — only registers brand-new people; leaves everyone already tracked untouched
+- **Check in** — treats the imported XP as a fresh checkin for existing users, exactly like they ran `/checkin` themselves. Their baseline, weekly progress, and checkin history all stay intact — this is the one to use for a routine bulk update (e.g. "here's everyone's current XP from this week's screenshots"), acting as a mass check-in instead of a reset.
+- **Reset** — wipes and restarts existing users' tracking, same as `/fullreset`. Use this for a genuine do-over, not routine updates — it discards their history.
+
+New users are always registered regardless of which option you pick for existing ones.
 
 **4. Check the results** — the bot replies with a summary: how many were newly tracked, skipped, **ambiguous** (matched more than one member), or **unmatched**. For unmatched rows, double-check the spelling matches what's actually in their nickname; for ambiguous ones, add a `discord_id` for those specific rows. Either way, you can always patch up the leftovers manually with `/setbaseline`.
 
@@ -206,7 +211,9 @@ or
 /exportdata file_format:Excel (.xlsx)
 ```
 
-Downloads a file with everyone's current stats: Discord ID, username, current XP, baseline XP, total gained, this week's starting XP, this week's gain, and the timestamp of their last checkin. Useful for backups, spreadsheet analysis outside Discord, or handing records to someone who doesn't have bot access. The CSV format uses the same column names `/importxp` expects, so round-tripping (export → edit → re-import) works without reformatting.
+Downloads a file with everyone's current stats: Discord ID, username, current XP (under a `starting_xp` header), baseline XP, total gained, this week's starting XP, this week's gain, and the timestamp of their last checkin. Useful for backups, spreadsheet analysis outside Discord, or handing records to someone who doesn't have bot access.
+
+**The `starting_xp` column name matches what `/importxp` expects**, so an exported file can be re-imported directly with no reformatting — export → (optionally edit) → `/importxp` that same file. What re-importing does depends on which `existing_users` mode you pick: **check in** treats each person's exported `current_xp` as a fresh checkin (history preserved) — the right choice for most re-imports; **reset** treats it as a full restart (history wiped), better suited to disaster recovery than routine use.
 
 ## Progress charts
 

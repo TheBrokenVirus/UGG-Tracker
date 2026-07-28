@@ -2359,7 +2359,7 @@ async def exportdata(interaction: discord.Interaction, file_format: app_commands
 
     rows = []
     headers = [
-        "discord_id", "username", "current_xp", "baseline_xp", "total_gained",
+        "discord_id", "username", "starting_xp", "baseline_xp", "total_gained",
         "week_start_xp", "gained_this_week", "last_checkin_time_utc",
     ]
     for uid, entry in guild_data["users"].items():
@@ -2370,7 +2370,7 @@ async def exportdata(interaction: discord.Interaction, file_format: app_commands
         rows.append([
             uid,
             username,
-            entry["current_xp"],
+            entry["current_xp"],  # exported under the "starting_xp" header so /importxp can read it directly
             baseline_xp,
             entry["current_xp"] - baseline_xp,
             entry["week_start_xp"],
@@ -2423,14 +2423,24 @@ async def exportdata(interaction: discord.Interaction, file_format: app_commands
 
 @bot.tree.command(
     name="importxp",
-    description="[Admin] Bulk-set starting XP for many users from a CSV or Excel file",
+    description="[Admin] Bulk-set XP for many users from a CSV or Excel file",
 )
 @app_commands.describe(
     file="A .csv or .xlsx file. Needs a column for XP (starting_xp/xp) and either discord_id or username",
-    overwrite="If true, also overwrite users who are already tracked (default: no, skip them)",
+    existing_users="What to do for users already being tracked (new users are always registered either way)",
 )
+@app_commands.choices(existing_users=[
+    app_commands.Choice(name="Skip them (default) — only register brand-new users", value="skip"),
+    app_commands.Choice(name="Check in — update XP like a normal checkin, keeps their history", value="checkin"),
+    app_commands.Choice(name="Reset — wipe and restart, like /fullreset", value="reset"),
+])
 @app_commands.checks.has_permissions(manage_guild=True)
-async def importxp(interaction: discord.Interaction, file: discord.Attachment, overwrite: bool = False):
+async def importxp(
+    interaction: discord.Interaction,
+    file: discord.Attachment,
+    existing_users: app_commands.Choice[str] = None,
+):
+    mode = existing_users.value if existing_users else "skip"
     await interaction.response.defer(thinking=True)
 
     guild = interaction.guild
@@ -2457,7 +2467,7 @@ async def importxp(interaction: discord.Interaction, file: discord.Attachment, o
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
 
-    created, updated, skipped, unmatched, ambiguous, bad_rows = [], [], [], [], [], []
+    created, checked_in, reset_list, skipped, unmatched, ambiguous, bad_rows = [], [], [], [], [], [], []
     roles_assigned_count = 0
 
     for row in rows:
@@ -2478,12 +2488,19 @@ async def importxp(interaction: discord.Interaction, file: discord.Attachment, o
 
         uid = str(member.id)
         existing = guild_data["users"].get(uid)
+        tag = " (via nickname match)" if match_type == "substring" else ""
 
-        if existing and not overwrite:
+        if existing and mode == "skip":
             skipped.append(member.display_name)
             continue
 
-        if existing:
+        if existing and mode == "checkin":
+            # Same as a normal /checkin: appends to their history and moves
+            # current_xp, but leaves baseline_xp and week_start_xp alone —
+            # this is what makes it a mass check-in rather than a reset.
+            record_checkin(existing, xp_val)
+            checked_in.append(f"{member.display_name} ({xp_val:,}){tag}")
+        elif existing and mode == "reset":
             now = utcnow()
             existing["current_xp"] = xp_val
             existing["baseline_xp"] = xp_val
@@ -2491,11 +2508,9 @@ async def importxp(interaction: discord.Interaction, file: discord.Attachment, o
             existing["week_start_time"] = iso(now)
             existing["week_start_xp"] = xp_val
             existing["checkins"] = [{"time": iso(now), "xp": xp_val}]
-            tag = " (via nickname match)" if match_type == "substring" else ""
-            updated.append(f"{member.display_name} ({xp_val:,}){tag}")
+            reset_list.append(f"{member.display_name} ({xp_val:,}){tag}")
         else:
             create_user(guild_data, member.id, xp_val)
-            tag = " (via nickname match)" if match_type == "substring" else ""
             created.append(f"{member.display_name} ({xp_val:,}){tag}")
 
         role_result = await apply_xp_roles(guild, member, guild_data, xp_val, announce=False)
@@ -2513,9 +2528,12 @@ async def importxp(interaction: discord.Interaction, file: discord.Attachment, o
 
     embed = discord.Embed(title="📥 XP Import Results", color=discord.Color.green())
     embed.add_field(name=f"✅ Newly tracked ({len(created)})", value=fmt_list(created), inline=False)
-    if overwrite:
-        embed.add_field(name=f"♻️ Overwritten ({len(updated)})", value=fmt_list(updated), inline=False)
-    embed.add_field(name=f"⏭️ Skipped — already tracked ({len(skipped)})", value=fmt_list(skipped), inline=False)
+    if mode == "checkin":
+        embed.add_field(name=f"🔁 Checked in ({len(checked_in)})", value=fmt_list(checked_in), inline=False)
+    elif mode == "reset":
+        embed.add_field(name=f"♻️ Reset ({len(reset_list)})", value=fmt_list(reset_list), inline=False)
+    else:
+        embed.add_field(name=f"⏭️ Skipped — already tracked ({len(skipped)})", value=fmt_list(skipped), inline=False)
     if ambiguous:
         embed.add_field(
             name=f"⚠️ Ambiguous — multiple matches ({len(ambiguous)})",
