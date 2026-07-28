@@ -85,9 +85,13 @@ weekly requirement (default: 20,000 XP/week).
 | `/syncxproles` | Admin | Re-checks every tracked member's roles right now — fixes leftover role clutter without waiting for everyone's next checkin. |
 | `/progresschart [user]` | Everyone | Shows a line chart of XP over time, built from that person's checkin history. Needs at least 2 checkins. |
 | `/profile [user]` | Everyone | Shows a rendered profile card: avatar, colored border, Crew XP, rank, this week's gain, and a progress bar. See below. |
-| `/setbordercolor user: color: [custom_hex]` | Admin | Assign a profile border color — a preset from the palette, or an exact hex code. See below. |
+| `/setbordercolor user: color: [custom_hex]` | Admin | Assign a profile border color — a preset from the palette, or an exact hex code. This is the *unpaid/default* look; see "Banner tiers" below for the store-linked version. |
 | `/removebordercolor user:<@user>` | Admin | Reset a user's border color to the default. |
 | `/listbordercolors` | Everyone | Show all available preset border colors. |
+| `/toggleanimatedprofile enabled:<true/false>` | Admin | Turn the animated rainbow-tier `/profile` card on or off server-wide (static image instead of a GIF). See below. |
+| `/addbannertier role: name: mode: color1: [color2] priority:` | Admin | Ties a profile banner look to a role — e.g. a role your store/Ko-fi integration grants on purchase. See "Banner tiers" below. |
+| `/removebannertier role:<@role>` | Admin | Removes a role's banner tier. |
+| `/listbannertiers` | Everyone | Shows all configured banner tiers, their roles, and their colors. |
 | `/exportdata [file_format]` | Admin | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
 | `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
@@ -296,7 +300,7 @@ Renders a line chart of that person's XP over time, built from their stored chec
 
 Chart generation depends on the `matplotlib` package (already in `requirements.txt`). If it's somehow missing, the command explains what to install rather than crashing.
 
-## Profile cards & border colors
+## Profile cards, animation & banner tiers
 
 ```
 /profile user:@SomeMember
@@ -304,23 +308,33 @@ Chart generation depends on the `matplotlib` package (already in `requirements.t
 
 Renders an image card — avatar with a colored ring, name, rank, Crew XP, this week's gain, and a progress bar toward the weekly requirement — instead of a plain text embed. Rank is calculated the same way as `/totalleaderboard`: by actual total XP, so it includes each person's starting point, not just XP gained while tracked.
 
-If any XP milestone roles are configured (see "XP milestone roles" below), the card also shows how much XP is needed for the next one not yet reached — e.g. "4,784 XP to Gold". Rank #1 gets a gold star and gold-accented rank text instead of their assigned border color, so the top spot stands out. Rank text otherwise uses a brightened, boosted-saturation version of the person's border color — the raw color looks great as a thick border/ring, but some presets (Slate, Obsidian especially) are too dark or muted to read comfortably as plain text against the card's dark background, so text specifically gets a readability boost while the border, ring, and progress bar keep the true assigned color. The card is drawn at high internal resolution and downscaled for smooth, anti-aliased edges rather than the jagged look raw drawing would otherwise produce, then shipped at 1350×510 — a higher native resolution than the card's actual design size, so it still looks sharp in Discord's small inline chat preview rather than blurry (Discord shrinks images further for that thumbnail, so shipping only "exactly as big as it needs to be" left it looking soft). The background has a subtle gradient tinted with the person's border color for extra visual polish without being distracting. Long display names are truncated based on actual rendered pixel width, not a fixed character count, so wide and narrow character names both fit correctly instead of some overflowing while others get cut short unnecessarily.
+If any XP milestone roles are configured (see "XP milestone roles" below), the card also shows how much XP is needed for the next one not yet reached — e.g. "4,784 XP to Gold". Rank #1 gets a gold star and gold-accented rank text regardless of banner tier, so the top spot always stands out. Rank text otherwise uses a brightened, boosted-saturation version of the tier's primary color — the raw color looks great as a thick border/ring, but some colors (dark, muted ones especially) are too hard to read comfortably as plain text against the card's dark background, so text specifically gets a readability boost while the border, ring, and progress bar keep the true color. The card is drawn at high internal resolution and downscaled for smooth, anti-aliased edges rather than the jagged look raw drawing would otherwise produce, then shipped at 1350×510 — a higher native resolution than the card's actual design size, so it still looks sharp in Discord's small inline chat preview rather than blurry. Long display names are truncated based on actual rendered pixel width, not a fixed character count, so wide and narrow character names both fit correctly instead of some overflowing while others get cut short unnecessarily.
 
 The rank-1 star and the rank-change up/down indicators are drawn as actual shapes, not Unicode symbol characters (★/▲/▼) — Windows' Arial, a common fallback font, doesn't reliably include those glyph blocks, which could make them silently fail to render (or show as a blank box) depending on what font the host has available. Drawing them as vector shapes instead means they always render correctly regardless of platform or installed fonts.
 
 **Daily rank change** — next to the rank, the card shows how much someone's rank has moved since the last daily snapshot: ▲2 in green for climbing, ▼1 in red for dropping, or — for no change. A background task takes one snapshot per UTC day for every server with tracked users (no shared week required for this specific feature, unlike the scheduled post and inactivity pings). The indicator only appears once at least one snapshot has happened — a server's very first day using the bot won't show a rank-change badge yet, since there's nothing to compare against.
 
-**Border colors are a cosmetic perk, currently assigned by admins:**
+### Banner tiers (store-linked)
 
 ```
-/setbordercolor user:@SomeMember color:Gold
+/addbannertier role:@Supporter name:"Supporter" mode:gradient color1:#FF3EA5 color2:#3498DB priority:1
+/addbannertier role:@Elite name:"Elite" mode:rainbow color1:#FFD700 priority:2
 ```
 
-There's a curated 12-color palette (`/listbordercolors` shows all of them) — Slate is the default for anyone with no color assigned, running up through Bronze, Silver, Gold, Emerald, Sapphire, Ruby, Amethyst, Sunset, Aurora, Obsidian, and Prism. You can also skip the palette and give someone an exact hex code with `custom_hex` if you want a one-off color outside the presets.
+Each tier ties a **profile banner look** to a Discord role — the intended flow is: someone buys a tier from your store (`/store`, below), your store's own integration (e.g. Ko-fi's Discord role sync) or you manually grants them the matching role, and the bot picks up on that role the next time they run `/profile`. There's no payment processing inside the bot itself; it only reacts to the role.
 
-**This is set up as the foundation for a future donation-perk system** — right now, `/setbordercolor` is admin-only, so *you* decide who gets which color (e.g. manually upgrading someone after they donate outside the bot). There's no automated payment or unlock system built yet; this just gives you the assignment mechanism and the visual payoff to build on top of later. If you want to add real donation handling down the line (a payment webhook automatically calling `/setbordercolor`, tracking who's "unlocked" which tier, letting donors pick their own color from what they've unlocked, etc.), that's a natural next step from here — just say the word when you're ready for it.
+Three modes:
+- **`solid`** — one flat color (`color1`), same as a classic border color.
+- **`gradient`** — a two-color sweep across the background, border, avatar ring, and progress bar fill, from `color1` (left) to `color2` (right, required for this mode). All four elements pull from the exact same gradient image, so they always stay in sync rather than each being tinted separately.
+- **`rainbow`** — the border and background slowly cycle through the full hue wheel, starting from `color1`, as an animated GIF. This is intentionally the most premium-looking option — reserve it for your top tier. A full color cycle takes a little over 4 seconds; it's deliberately slow and smooth rather than fast, since rapid color cycling reads as flashing and can be uncomfortable for motion/light-sensitive members.
 
-Card rendering depends on the `Pillow` package (already in `requirements.txt`). If it's somehow missing, the command explains what to install rather than crashing. Font rendering automatically adapts to whatever's available on the host — it checks common Linux, Windows, and macOS font locations and falls back to a built-in font if none are found, so the card looks right on your Windows PC during testing and on whatever you eventually host it on.
+If a member holds roles for more than one tier (e.g. they kept an old role after upgrading), `priority` decides which one wins — higher number = more premium, and only the single highest one is ever shown, never a blend. Set it however you like; it just needs to be higher for the tiers you consider more valuable. `/listbannertiers` shows everything currently configured, highest priority first. `/removebannertier` takes a tier away from a role.
+
+**Members with no tier role** fall back to the older, individually-assigned system: whatever `/setbordercolor` has set for them (a preset or custom hex, always `solid`), or the Slate default if nothing's been set. That command still works exactly as before — it's a good fit for a free/no-purchase-required look, or for one-off manual color assignments outside the tier system.
+
+`/toggleanimatedprofile enabled:false` is a server-wide override for the `rainbow` mode specifically — solid and gradient tiers are always static regardless of this setting. Turn it off if you'd rather trade the animation for lower bandwidth/faster `/profile` responses (an animated card takes a few seconds longer to render and is several megabytes, versus well under a second and under 200KB for a static one), or for accessibility if anyone in your server is sensitive to on-screen motion. With it off, `rainbow`-tier members still get their tier's card, just as a static frame at `color1` instead of animating.
+
+Card rendering depends on the `Pillow` package (already in `requirements.txt`). If it's somehow missing, `/profile` explains what to install rather than crashing. Font rendering automatically adapts to whatever's available on the host — it checks common Linux, Windows, and macOS font locations and falls back to a built-in font if none are found, so the card looks right on your Windows PC during testing and on whatever you eventually host it on.
 
 ## Store
 
@@ -331,7 +345,7 @@ Card rendering depends on the `Pillow` package (already in `requirements.txt`). 
 
 `/store` shows everyone a menu of whatever products you've configured, plus a **Visit Store** button linking wherever purchases actually happen — a Ko-fi page, a website, a Discord shop channel, wherever you're set up to take payments. The bot doesn't process payments itself; this is a catalog and a signpost, not a checkout.
 
-**This is the other half of the border-color donation system** mentioned above — `/store` is where members find out *what's for sale and where to buy it*, and `/setbordercolor` is where an admin actually grants the perk after a purchase happens (manually, for now). Together they give you a working storefront today, with the door left open for automating the middle step later — e.g. a payment webhook that calls `/setbordercolor` automatically instead of you doing it by hand each time. Say the word whenever you're ready to build that part.
+**This is the other half of the banner tier system** described above — `/store` is where members find out *what's for sale and where to buy it*, and the role they receive after buying (via your store's own role-granting integration, or manually) is what `/addbannertier` keys off of to show the right banner on their `/profile` card. Together they give you a working storefront today: list a product, tell buyers what role/tier it grants, and the visual payoff is automatic from there on. If you want to fully automate the middle step later too (a payment webhook that assigns the role itself, so no manual step is needed anywhere in the chain), that's a natural next step from here — just say the word when you're ready for it.
 
 Products are stored per-server (up to 25, a Discord embed limit) with a name, price (any free-text format — `$5`, `500 Robux`, `Free`, whatever fits how you actually sell things), an optional description, and an optional emoji. Remove one with `/removeproduct` using its exact name, or via the settings panel's dropdown if you'd rather not worry about exact spelling.
 

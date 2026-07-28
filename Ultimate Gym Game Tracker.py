@@ -18,7 +18,7 @@ import json
 import math
 import colorsys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -146,6 +146,8 @@ def default_guild_data() -> dict:
         "last_rank_snapshot_date": None,
         "store_url": None,
         "store_products": [],
+        "animated_profiles": True,
+        "banner_tiers": [],
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -931,6 +933,17 @@ def _fit_text_to_width(draw: "ImageDraw.ImageDraw", text: str, font, max_width: 
         text = text[:-1]
     return (text + "…") if text else "…"
 
+def _rotate_hue(rgb: tuple, degrees: float) -> tuple:
+    """Returns rgb rotated around the hue wheel by degrees (0-360), keeping
+    lightness and saturation unchanged — used to animate the profile card's
+    border/background through a smooth color cycle without altering how
+    light/dark or vivid the assigned color reads at each step."""
+    r, g, b = (c / 255 for c in rgb[:3])
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    h = (h + degrees / 360.0) % 1.0
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return (int(r2 * 255), int(g2 * 255), int(b2 * 255), 255)
+
 def _readable_text_variant(rgb: tuple, min_lightness: float = 0.62, min_saturation: float = 0.35) -> tuple:
     """A border color that looks great as a thick outline or filled bar
     can still be too dark/muted to read comfortably as text against a
@@ -974,6 +987,49 @@ def get_border_color(entry: dict) -> str:
     won't have a border_color key."""
     return entry.get("border_color", DEFAULT_BORDER_COLOR)
 
+def get_animated_profiles_enabled(guild_data: dict) -> bool:
+    """Backward-compatible getter — defaults to True. Admins can opt out
+    with /toggleanimatedprofile (static PNG instead of an animated GIF) for
+    bandwidth, render-time, or motion-sensitivity reasons. Note this is an
+    accessibility override on top of banner tiers: it only matters for
+    members whose banner tier mode is "rainbow" — solid/gradient tiers are
+    always static regardless of this setting."""
+    return guild_data.get("animated_profiles", True)
+
+def _parse_hex_color(raw: str) -> Optional[str]:
+    """Normalizes a user-supplied hex color like 'FF5733' or '#ff5733' to
+    '#FF5733', or returns None if it isn't a valid 6-digit hex color."""
+    cleaned = raw.strip().lstrip("#")
+    if len(cleaned) != 6 or any(c not in "0123456789abcdefABCDEF" for c in cleaned):
+        return None
+    return f"#{cleaned.upper()}"
+
+def get_banner_tiers(guild_data: dict) -> list:
+    """Backward-compatible getter — older guild entries won't have this
+    key. Returns a list of {"role_id": int, "name": str,
+    "mode": "solid"|"gradient"|"rainbow", "color1": hex,
+    "color2": hex or None, "priority": int} mappings, sorted ascending by
+    priority (so the last entry is the highest tier)."""
+    tiers = guild_data.get("banner_tiers", [])
+    tiers.sort(key=lambda t: t["priority"])
+    return tiers
+
+def get_member_banner_tier(guild_data: dict, member: discord.Member) -> Optional[dict]:
+    """Picks the highest-priority configured banner tier whose role the
+    member currently holds — mirrors the exclusive-XP-role-ladder logic:
+    if someone holds roles for more than one tier (e.g. they kept an old
+    supporter role after upgrading), the single most premium one wins,
+    never a blend of both. Returns None if the member holds no tier role,
+    in which case the profile card falls back to their individually
+    assigned border_color (the pre-tier system, still available as the
+    unpaid/default look)."""
+    tiers = get_banner_tiers(guild_data)
+    if not tiers or not hasattr(member, "roles"):
+        return None
+    member_role_ids = {r.id for r in member.roles}
+    qualifying = [t for t in tiers if t["role_id"] in member_role_ids]
+    return qualifying[-1] if qualifying else None  # ascending sort, so last = highest priority
+
 def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
     """Compares current rank against the most recent daily snapshot
     (see scheduled_checks). Positive = moved up (better rank, lower
@@ -984,37 +1040,80 @@ def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
         return None
     return daily_rank - current_rank
 
+# Animated profile cards: a full hue rotation happens over roughly
+# ANIMATED_PROFILE_FRAMES * ANIMATED_PROFILE_FRAME_MS milliseconds (26 * 160
+# ≈ 4.2s per loop) — slow and smooth is intentional, since a fast color
+# cycle reads as flashing/strobing rather than a nice glow, and could be
+# uncomfortable for motion/light-sensitive users. Rendered at a lower
+# supersampling factor than the static card (3x vs 5x) since it's paid
+# for once per frame instead of once total — still enough headroom for
+# clean edges after the downscale to FINAL_W/FINAL_H.
+ANIMATED_PROFILE_FRAMES = 26
+ANIMATED_PROFILE_FRAME_MS = 160
+ANIMATED_PROFILE_SCALE = 3
+STATIC_PROFILE_SCALE = 5
+
 async def build_profile_card(
     member: discord.abc.User, entry: dict, stats: dict, requirement: int, rank: int, total_members: int,
     next_milestone: Optional[tuple] = None, rank_change: Optional[int] = None,
+    banner: Optional[dict] = None, animation_allowed: bool = True,
 ) -> Optional[io.BytesIO]:
-    """Renders a profile card PNG: avatar with a colored ring, name, rank
+    """Renders a profile card: avatar with a colored ring, name, rank
     (with a daily rank-change indicator), Crew XP, this week's gain, and a
-    weekly-progress bar — all in the member's assigned border color, over
-    a subtly tinted background gradient. next_milestone, if given, is
-    (xp_needed, role_name) for the next XP-ladder role not yet reached.
-    rank_change, if given, is current-vs-yesterday's-snapshot rank
-    movement (positive = moved up). Returns None if Pillow isn't installed.
+    weekly-progress bar over a subtly tinted background. Returns None if
+    Pillow isn't installed.
 
-    Rendered at high internal resolution and downscaled with a smoothing
-    filter (supersampling) — PIL doesn't anti-alias its own drawing, so
-    every curved edge (border, avatar ring, progress bar) would otherwise
-    look jagged at the final size. The rank-1 star and rank-change arrows
-    are drawn as vector shapes rather than Unicode glyphs (★/▲/▼) — Arial,
-    a common Windows fallback font, doesn't reliably include those glyph
-    blocks, so text rendering could silently fail to show them on some
-    platforms. Shapes always render correctly regardless of font."""
+    next_milestone, if given, is (xp_needed, role_name) for the next
+    XP-ladder role not yet reached. rank_change, if given, is
+    current-vs-yesterday's-snapshot rank movement (positive = moved up).
+
+    The look of the border/background comes from `banner`, the member's
+    resolved banner tier (see get_member_banner_tier) — a dict with
+    "mode" ("solid", "gradient", or "rainbow") and "color1"/"color2" hex
+    colors, or None if the member holds no tier role, in which case this
+    falls back to their individually assigned border_color (the free,
+    pre-tier look, still set via /setbordercolor):
+
+    - "solid": a single color, same as the original profile card.
+    - "gradient": a static two-color sweep across the background, border,
+      avatar ring, and progress bar fill — color1 on the left, color2 on
+      the right (the fill bar shows more of color1 early on and eases
+      into color2 as it fills, since it's masked against the same
+      gradient image rather than tinted with a flat color).
+    - "rainbow": the border/background slowly cycle through the full hue
+      wheel starting from color1, rendered as an animated GIF — unless
+      animation_allowed is False (a server's /toggleanimatedprofile
+      setting), in which case it renders as a static frame at color1
+      instead. This keeps "rainbow" as the one animated, most premium
+      look, with an accessibility/bandwidth escape hatch that still
+      applies regardless of tier.
+
+    Each frame is rendered at high internal resolution and downscaled with
+    a smoothing filter (supersampling) — PIL doesn't anti-alias its own
+    drawing, so every curved edge (border, avatar ring, progress bar)
+    would otherwise look jagged at the final size. The rank-1 star and
+    rank-change arrows are drawn as vector shapes rather than Unicode
+    glyphs (★/▲/▼) — Arial, a common Windows fallback font, doesn't
+    reliably include those glyph blocks, so text rendering could silently
+    fail to show them on some platforms. Shapes always render correctly
+    regardless of font."""
     if Image is None:
         return None
 
-    # Rendered at a higher factor than the final shipped size (see resize
-    # at the bottom): SCALE controls anti-aliasing quality during drawing,
-    # FINAL_W/FINAL_H controls what actually gets sent to Discord — set
-    # well above the card's own design size so Discord's inline chat
-    # preview (which shrinks images further for its thumbnail) still has
-    # enough source detail to look sharp rather than blurry.
-    SCALE = 5
+    if banner is None:
+        mode = "solid"
+        color1_rgb = _hex_to_rgb(get_border_color(entry)) + (255,)
+        color2_rgb = None
+    else:
+        mode = banner["mode"]
+        color1_rgb = _hex_to_rgb(banner["color1"]) + (255,)
+        color2_rgb = _hex_to_rgb(banner["color2"]) + (255,) if banner.get("color2") else None
+
+    if mode == "rainbow" and not animation_allowed:
+        mode = "solid"  # accessibility/bandwidth override — see docstring
+
     FINAL_W, FINAL_H = 1350, 510
+    SCALE = ANIMATED_PROFILE_SCALE if mode == "rainbow" else STATIC_PROFILE_SCALE
     CARD_W, CARD_H = 900 * SCALE, 340 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
@@ -1026,10 +1125,6 @@ async def build_profile_card(
     RANK_UP_GREEN = (99, 209, 129, 255)
     RANK_DOWN_RED = (230, 90, 90, 255)
 
-    border_hex = get_border_color(entry)
-    border_rgb = _hex_to_rgb(border_hex) + (255,)
-    rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
-
     # Fetch avatar bytes directly through discord.py's Asset — no extra HTTP client needed
     try:
         avatar_bytes = await member.display_avatar.replace(size=256, format="png").read()
@@ -1037,43 +1132,23 @@ async def build_profile_card(
     except (discord.HTTPException, discord.NotFound):
         avatar_img = Image.new("RGBA", (256, 256), (88, 101, 242, 255))
 
-    # Subtle background gradient — a gentle tint of the border color fading
-    # in from the left (where the colored avatar ring is) toward plain
-    # background on the right. Uses Pillow's built-in gradient generator
-    # (no numpy dependency) as an alpha mask between two solid-color
-    # layers, then clips it to the card's rounded-corner shape.
-    def _tint(base_rgb, accent_rgb, ratio):
-        return tuple(int(base_rgb[i] * (1 - ratio) + accent_rgb[i] * ratio) for i in range(3))
-
-    tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
-    bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
-    bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
-    grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
-    bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+    # Everything that doesn't depend on the border color is computed once,
+    # up front, and reused across every frame (there's only ever one frame
+    # for a static card) — masks, fonts, avatar resize, and text layout.
+    avatar_size = 220 * SCALE
+    avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
+    avatar_resized = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
+    avatar_mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(avatar_mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
+    ring_pad = 6 * SCALE
 
     corner_mask = Image.new("L", (CARD_W, CARD_H), 0)
     ImageDraw.Draw(corner_mask).rounded_rectangle([0, 0, CARD_W - 1, CARD_H - 1], radius=24 * SCALE, fill=255)
-    card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
-    card.paste(bg_gradient, (0, 0), corner_mask)
-    draw = ImageDraw.Draw(card)
-
-    draw.rounded_rectangle(
-        [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
-        radius=22 * SCALE, outline=border_rgb, width=8 * SCALE,
-    )
-
-    avatar_size = 220 * SCALE
-    avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
-    avatar_img = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
-    mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
-    ring_pad = 6 * SCALE
-    draw.ellipse(
-        [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
-         avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
-        outline=border_rgb, width=5 * SCALE,
-    )
-    card.paste(avatar_img, avatar_pos, mask)
+    # Left-to-right gradient mask, bright (255) on the left where the
+    # avatar ring sits, fading to dark (0) on the right — reused both for
+    # the subtle single-color background tint (solid/rainbow modes) and
+    # as the blend between color1/color2 (gradient mode).
+    grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
 
     text_x = 35 * SCALE + avatar_size + 45 * SCALE
     font_name = _find_profile_font(True, 44 * SCALE)
@@ -1084,69 +1159,192 @@ async def build_profile_card(
     font_bar_label = _find_profile_font(False, 15 * SCALE)
 
     max_name_width = CARD_W - text_x - 40 * SCALE  # same right margin used by the bar/stats below
-    display_name = _fit_text_to_width(draw, member.display_name, font_name, max_name_width)
-    draw.text((text_x, 46 * SCALE), display_name, font=font_name, fill=WHITE)
-
-    rank_y = 118 * SCALE
-    rank_text_x = text_x
-    if rank == 1:
-        star_outer_r = 12 * SCALE
-        star_cx = text_x + star_outer_r
-        star_cy = rank_y + 17 * SCALE
-        draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
-        rank_text_x = text_x + star_outer_r * 2 + 10 * SCALE
-
-    rank_line = f"Rank #{rank} of {total_members}"
-    draw.text((rank_text_x, rank_y), rank_line, font=font_rank, fill=rank_text_rgb)
-
-    if rank_change is not None:
-        badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
-        badge_cy = rank_y + 19 * SCALE
-        if rank_change > 0:
-            draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
-            draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
-        elif rank_change < 0:
-            draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
-            draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
-        else:
-            draw.rounded_rectangle(
-                [badge_x, badge_cy - 3 * SCALE, badge_x + 16 * SCALE, badge_cy + 3 * SCALE],
-                radius=3 * SCALE, fill=MUTED_TEXT,
-            )
-
-    if next_milestone:
-        needed, role_name = next_milestone
-        milestone_font = _find_profile_font(False, 17 * SCALE)
-        draw.text(
-            (text_x, 156 * SCALE), f"{needed:,} XP to {role_name}",
-            font=milestone_font, fill=MUTED_TEXT,
-        )
-
-    stat_y = 200 * SCALE
-    draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
-    draw.text((text_x, stat_y + 28 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
-
-    stat_x2 = text_x + 290 * SCALE
-    draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
-    week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
-    draw.text((stat_x2, stat_y + 28 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+    _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    display_name = _fit_text_to_width(_measure_draw, member.display_name, font_name, max_name_width)
 
     bar_x, bar_y = text_x, 296 * SCALE
     bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 24 * SCALE
     effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
     pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
-    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=12 * SCALE, fill=BAR_BG)
-    if pct > 0:
-        fill_w = max(int(bar_w * pct), bar_h)
-        draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=12 * SCALE, fill=border_rgb)
-    draw.text(
-        (bar_x, bar_y - 24 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
-        font=font_bar_label, fill=MUTED_TEXT,
-    )
+    fill_w = max(int(bar_w * pct), bar_h) if pct > 0 else 0
 
-    card = card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
+    def _tint(base_rgb, accent_rgb, ratio):
+        return tuple(int(base_rgb[i] * (1 - ratio) + accent_rgb[i] * ratio) for i in range(3))
+
+    def _draw_body(card: "Image.Image", draw: "ImageDraw.ImageDraw", rank_text_rgb: tuple):
+        """Everything that isn't the background/border/bar fill — avatar,
+        name, rank, milestone text, stats. Identical across every mode."""
+        draw.text((text_x, 46 * SCALE), display_name, font=font_name, fill=WHITE)
+
+        rank_y = 118 * SCALE
+        rank_text_x = text_x
+        if rank == 1:
+            star_outer_r = 12 * SCALE
+            star_cx = text_x + star_outer_r
+            star_cy = rank_y + 17 * SCALE
+            draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
+            rank_text_x = text_x + star_outer_r * 2 + 10 * SCALE
+
+        rank_line = f"Rank #{rank} of {total_members}"
+        draw.text((rank_text_x, rank_y), rank_line, font=font_rank, fill=rank_text_rgb)
+
+        if rank_change is not None:
+            badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
+            badge_cy = rank_y + 19 * SCALE
+            if rank_change > 0:
+                draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
+                draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
+            elif rank_change < 0:
+                draw.polygon(_triangle_points(badge_x + 8 * SCALE, badge_cy, 8 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
+                draw.text((badge_x + 20 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
+            else:
+                draw.rounded_rectangle(
+                    [badge_x, badge_cy - 3 * SCALE, badge_x + 16 * SCALE, badge_cy + 3 * SCALE],
+                    radius=3 * SCALE, fill=MUTED_TEXT,
+                )
+
+        if next_milestone:
+            needed, role_name = next_milestone
+            milestone_font = _find_profile_font(False, 17 * SCALE)
+            draw.text(
+                (text_x, 156 * SCALE), f"{needed:,} XP to {role_name}",
+                font=milestone_font, fill=MUTED_TEXT,
+            )
+
+        stat_y = 200 * SCALE
+        draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
+        draw.text((text_x, stat_y + 28 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
+
+        stat_x2 = text_x + 290 * SCALE
+        draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
+        week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
+        draw.text((stat_x2, stat_y + 28 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=12 * SCALE, fill=BAR_BG)
+        draw.text(
+            (bar_x, bar_y - 24 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
+            font=font_bar_label, fill=MUTED_TEXT,
+        )
+
+    def render_solid_frame(border_rgb: tuple) -> "Image.Image":
+        """Draws one full card in a single solid color and returns it
+        already downscaled to FINAL_W/FINAL_H. Used for the "solid" mode
+        (once) and "rainbow" mode (once per hue-rotated frame)."""
+        rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
+
+        tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
+        bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
+        bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
+        bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+
+        card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+        card.paste(bg_gradient, (0, 0), corner_mask)
+        draw = ImageDraw.Draw(card)
+
+        draw.rounded_rectangle(
+            [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
+            radius=22 * SCALE, outline=border_rgb, width=8 * SCALE,
+        )
+        draw.ellipse(
+            [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
+             avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
+            outline=border_rgb, width=5 * SCALE,
+        )
+        card.paste(avatar_resized, avatar_pos, avatar_mask)
+
+        _draw_body(card, draw, rank_text_rgb)
+        if fill_w:
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=12 * SCALE, fill=border_rgb)
+
+        return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
+
+    def render_gradient_frame(c1_rgb: tuple, c2_rgb: tuple) -> "Image.Image":
+        """Draws the static two-color "gradient" mode: background, border
+        outline, avatar ring, and progress-bar fill all sweep from c1
+        (left) to c2 (right) using one shared gradient image applied
+        through masks, so every element reads from the exact same blend
+        instead of each being tinted independently."""
+        rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(c1_rgb)
+
+        c1_layer = Image.new("RGBA", (CARD_W, CARD_H), c1_rgb)
+        c2_layer = Image.new("RGBA", (CARD_W, CARD_H), c2_rgb)
+        color_gradient = Image.composite(c1_layer, c2_layer, grad_mask)  # c1 on the left, c2 on the right
+
+        tinted_c1 = _tint(BG_COLOR[:3], c1_rgb[:3], 0.13) + (255,)
+        tinted_c2 = _tint(BG_COLOR[:3], c2_rgb[:3], 0.13) + (255,)
+        bg_c1 = Image.new("RGBA", (CARD_W, CARD_H), tinted_c1)
+        bg_c2 = Image.new("RGBA", (CARD_W, CARD_H), tinted_c2)
+        bg_gradient = Image.composite(bg_c1, bg_c2, grad_mask)
+
+        card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+        card.paste(bg_gradient, (0, 0), corner_mask)
+        draw = ImageDraw.Draw(card)
+
+        # Outline strokes (card border + avatar ring) painted with the
+        # gradient by drawing them onto a one-off mask, then pasting the
+        # gradient image through that mask — Pillow can't stroke a shape
+        # with a gradient directly.
+        stroke_mask = Image.new("L", (CARD_W, CARD_H), 0)
+        stroke_draw = ImageDraw.Draw(stroke_mask)
+        stroke_draw.rounded_rectangle(
+            [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
+            radius=22 * SCALE, outline=255, width=8 * SCALE,
+        )
+        stroke_draw.ellipse(
+            [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
+             avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
+            outline=255, width=5 * SCALE,
+        )
+        card.paste(color_gradient, (0, 0), stroke_mask)
+        card.paste(avatar_resized, avatar_pos, avatar_mask)
+
+        _draw_body(card, draw, rank_text_rgb)
+        if fill_w:
+            bar_mask = Image.new("L", (CARD_W, CARD_H), 0)
+            ImageDraw.Draw(bar_mask).rounded_rectangle(
+                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=12 * SCALE, fill=255,
+            )
+            card.paste(color_gradient, (0, 0), bar_mask)
+
+        return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)
+
     buf = io.BytesIO()
-    card.convert("RGB").save(buf, format="PNG")
+
+    if mode == "gradient" and color2_rgb is not None:
+        frame = render_gradient_frame(color1_rgb, color2_rgb).convert("RGB")
+        frame.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
+
+    if mode != "rainbow":
+        frame = render_solid_frame(color1_rgb).convert("RGB")
+        frame.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
+
+    frames = [
+        render_solid_frame(_rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES))).convert("RGB")
+        for i in range(ANIMATED_PROFILE_FRAMES)
+    ]
+
+    # GIF frames each need a palette. Quantizing every frame independently
+    # would let each one pick slightly different colors and flicker; instead
+    # a handful of frames spread across the full hue cycle are combined into
+    # one strip and quantized together, and every frame is then mapped onto
+    # that one shared palette so colors stay consistent frame-to-frame.
+    sample_count = min(8, len(frames))
+    sample_step = max(len(frames) // sample_count, 1)
+    strip_samples = frames[::sample_step][:sample_count]
+    strip = Image.new("RGB", (strip_samples[0].width * len(strip_samples), strip_samples[0].height))
+    for i, sample in enumerate(strip_samples):
+        strip.paste(sample, (i * sample.width, 0))
+    shared_palette = strip.quantize(colors=256, method=Image.MEDIANCUT)
+
+    quantized = [f.quantize(palette=shared_palette, dither=Image.FLOYDSTEINBERG) for f in frames]
+    quantized[0].save(
+        buf, format="GIF", save_all=True, append_images=quantized[1:],
+        duration=ANIMATED_PROFILE_FRAME_MS, loop=0, disposal=2,
+    )
     buf.seek(0)
     return buf
 
@@ -1955,10 +2153,16 @@ HELP_CATEGORIES = [
         ("/removexprole role:<@role>", "Stop auto-assigning a role"),
         ("/syncxproles", "Re-check everyone's roles right now"),
     ]),
+    ("admin_banners", "Admin: Banner Tiers", "🎗️", "Tying profile banner looks to store/supporter roles", [
+        ("/addbannertier role: name: mode: color1: [color2] priority:", "Tie a banner look to a role"),
+        ("/removebannertier role:<@role>", "Remove a role's banner tier"),
+        ("/listbannertiers", "Show all configured banner tiers"),
+    ]),
     ("admin_display", "Admin: Display", "🎨", "How leaderboards and status look", [
         ("/togglerecentrate enabled:", "Show/hide the \"Recent Rate\" field"),
         ("/togglecompactleaderboard enabled:", "Short vs. full-detail leaderboard entries"),
         ("/toggleleaderboardpagination enabled:", "Previous/Next paging vs. a single truncated embed"),
+        ("/toggleanimatedprofile enabled:", "Animated color-cycling /profile card vs. a static image"),
     ]),
     ("admin_automation", "Admin: Channels & Automation", "📢", "Restrictions, announcements, schedules, pings", [
         ("/setchannel channel:<#channel>", "Restrict tracking commands to one channel"),
@@ -2080,12 +2284,14 @@ class RequirementWeekView(discord.ui.View):
 
 
 class DisplaySettingsView(discord.ui.View):
-    def __init__(self, guild_id: int, show_recent_rate: bool, compact_leaderboard: bool, leaderboard_pagination: bool):
+    def __init__(self, guild_id: int, show_recent_rate: bool, compact_leaderboard: bool, leaderboard_pagination: bool,
+                 animated_profiles: bool = True):
         super().__init__(timeout=300)
         self.guild_id = guild_id
         self._set_recent_rate_label(show_recent_rate)
         self._set_compact_label(compact_leaderboard)
         self._set_pagination_label(leaderboard_pagination)
+        self._set_animated_profiles_label(animated_profiles)
 
     def _set_recent_rate_label(self, enabled: bool):
         self.toggle_recent_rate.label = "Recent Rate: ON" if enabled else "Recent Rate: OFF"
@@ -2098,6 +2304,10 @@ class DisplaySettingsView(discord.ui.View):
     def _set_pagination_label(self, enabled: bool):
         self.toggle_pagination.label = "Pagination: ON" if enabled else "Pagination: OFF"
         self.toggle_pagination.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+
+    def _set_animated_profiles_label(self, enabled: bool):
+        self.toggle_animated_profiles.label = "Animated Profiles: ON" if enabled else "Animated Profiles: OFF"
+        self.toggle_animated_profiles.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
 
     @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2133,6 +2343,17 @@ class DisplaySettingsView(discord.ui.View):
         guild_data["leaderboard_pagination"] = new_state
         save_data(data)
         self._set_pagination_label(new_state)
+        embed = build_settings_embed(guild_data)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Animated Profiles: ON", style=discord.ButtonStyle.success, emoji="🌈")
+    async def toggle_animated_profiles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        new_state = not get_animated_profiles_enabled(guild_data)
+        guild_data["animated_profiles"] = new_state
+        save_data(data)
+        self._set_animated_profiles_label(new_state)
         embed = build_settings_embed(guild_data)
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -2401,6 +2622,7 @@ def build_settings_category_view(category: str, guild_id: int, guild_data: dict)
             show_recent_rate_enabled(guild_data),
             compact_leaderboard_enabled(guild_data),
             leaderboard_pagination_enabled(guild_data),
+            get_animated_profiles_enabled(guild_data),
         )
     if category == "roles":
         return RolesSettingsView(guild_id)
@@ -3058,12 +3280,17 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
         next_milestone = (next_mapping["xp"] - entry["current_xp"], role_name)
 
     rank_change = get_rank_change(entry, rank)
+    animation_allowed = get_animated_profiles_enabled(guild_data)
+    banner = get_member_banner_tier(guild_data, target)
 
     card_buf = await build_profile_card(
         target, entry, stats, guild_data["requirement"], rank, total_members,
         next_milestone=next_milestone, rank_change=rank_change,
+        banner=banner, animation_allowed=animation_allowed,
     )
-    file = discord.File(fp=card_buf, filename="profile.png")
+    will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
+    filename = "profile.gif" if will_animate else "profile.png"
+    file = discord.File(fp=card_buf, filename=filename)
     await interaction.followup.send(file=file)
 
 
@@ -3143,6 +3370,21 @@ async def togglerecentrate(interaction: discord.Interaction, enabled: bool):
     save_data(data)
     state = "shown" if enabled else "hidden"
     await interaction.response.send_message(f"Recent Rate will now be **{state}** on `/status` and `/checkin`.")
+
+
+@bot.tree.command(
+    name="toggleanimatedprofile",
+    description="[Admin] Turn the animated /profile card border on or off (static image instead of an animated GIF)",
+)
+@app_commands.describe(enabled="True for a slow color-cycling border/background, false for a static image")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def toggleanimatedprofile(interaction: discord.Interaction, enabled: bool):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["animated_profiles"] = enabled
+    save_data(data)
+    state = "an animated GIF" if enabled else "a static image"
+    await interaction.response.send_message(f"`/profile` will now send **{state}**.")
 
 
 @bot.tree.command(
@@ -4030,14 +4272,13 @@ async def setbordercolor(
         return
 
     if custom_hex:
-        cleaned = custom_hex.strip().lstrip("#")
-        if len(cleaned) != 6 or any(c not in "0123456789abcdefABCDEF" for c in cleaned):
+        hex_value = _parse_hex_color(custom_hex)
+        if hex_value is None:
             await interaction.response.send_message(
                 "That doesn't look like a valid hex color — use a format like `#FF5733` or `FF5733`.",
                 ephemeral=True,
             )
             return
-        hex_value = f"#{cleaned.upper()}"
     elif color:
         hex_value = color.value
     else:
@@ -4079,6 +4320,123 @@ async def listbordercolors(interaction: discord.Interaction):
         color=discord.Color.blurple(),
     )
     embed.set_footer(text="Slate is the default. Admins assign colors with /setbordercolor.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="addbannertier",
+    description="[Admin] Tie a profile banner look to a role — e.g. a supporter role from your store",
+)
+@app_commands.describe(
+    role="Members with this role get this banner look on /profile",
+    name="A short label for this tier (e.g. 'Supporter', 'Elite') — shown in /listbannertiers",
+    mode="solid = one color, gradient = two-color sweep, rainbow = animated color-cycle (most premium)",
+    color1="Primary hex color (e.g. #FF5733) — the only color used for solid/rainbow, the left side for gradient",
+    color2="Second hex color — required for gradient mode, ignored otherwise",
+    priority="Higher number = more premium. If a member holds roles for multiple tiers, the highest priority wins.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def addbannertier(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    name: str,
+    mode: Literal["solid", "gradient", "rainbow"],
+    color1: str,
+    priority: int,
+    color2: Optional[str] = None,
+):
+    hex1 = _parse_hex_color(color1)
+    if hex1 is None:
+        await interaction.response.send_message(
+            f"`{color1}` doesn't look like a valid hex color — use a format like `#FF5733`.", ephemeral=True
+        )
+        return
+
+    hex2 = None
+    if mode == "gradient":
+        if color2 is None:
+            await interaction.response.send_message(
+                "Gradient mode needs a `color2` — that's the color it sweeps into.", ephemeral=True
+            )
+            return
+        hex2 = _parse_hex_color(color2)
+        if hex2 is None:
+            await interaction.response.send_message(
+                f"`{color2}` doesn't look like a valid hex color — use a format like `#FF5733`.", ephemeral=True
+            )
+            return
+    elif color2 is not None:
+        hex2 = _parse_hex_color(color2)  # stored but unused outside gradient mode; validate anyway if given
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    tiers = guild_data.setdefault("banner_tiers", [])
+    tiers[:] = [t for t in tiers if t["role_id"] != role.id]  # replace if this role already has a tier
+    tiers.append({
+        "role_id": role.id, "name": name, "mode": mode,
+        "color1": hex1, "color2": hex2, "priority": priority,
+    })
+    save_data(data)
+
+    mode_desc = {"solid": hex1, "gradient": f"{hex1} → {hex2}", "rainbow": f"animated, starting at {hex1}"}[mode]
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Added banner tier",
+        target=role.mention, details=f"{name} — {mode} ({mode_desc}), priority {priority}",
+    )
+    await interaction.response.send_message(
+        f"Banner tier **{name}** added — members with {role.mention} now get the **{mode}** look ({mode_desc})."
+    )
+
+
+@bot.tree.command(name="removebannertier", description="[Admin] Remove a role's banner tier")
+@app_commands.describe(role="The role whose banner tier should be removed")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def removebannertier(interaction: discord.Interaction, role: discord.Role):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    tiers = guild_data.setdefault("banner_tiers", [])
+    before = len(tiers)
+    tiers[:] = [t for t in tiers if t["role_id"] != role.id]
+    if len(tiers) == before:
+        await interaction.response.send_message(f"{role.mention} doesn't have a banner tier configured.", ephemeral=True)
+        return
+    save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Removed banner tier", target=role.mention,
+    )
+    await interaction.response.send_message(
+        f"Removed the banner tier for {role.mention}. Members with that role now fall back to their "
+        f"individually assigned border color (or the default, if none is set)."
+    )
+
+
+@bot.tree.command(name="listbannertiers", description="Show all configured profile banner tiers")
+async def listbannertiers(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    tiers = get_banner_tiers(guild_data)
+
+    if not tiers:
+        await interaction.response.send_message(
+            "No banner tiers configured yet. Admins can add one with `/addbannertier`.", ephemeral=True
+        )
+        return
+
+    lines = []
+    for tier in reversed(tiers):  # highest priority first
+        role_mention = f"<@&{tier['role_id']}>"
+        if tier["mode"] == "solid":
+            look = tier["color1"]
+        elif tier["mode"] == "gradient":
+            look = f"{tier['color1']} → {tier['color2']}"
+        else:
+            look = f"animated, starting at {tier['color1']}"
+        lines.append(f"**{tier['name']}** (priority {tier['priority']}) — {role_mention} — {tier['mode']}: {look}")
+
+    embed = discord.Embed(
+        title="🎗️ Profile Banner Tiers", description="\n".join(lines), color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Highest priority wins if a member holds multiple tier roles. Configure with /addbannertier.")
     await interaction.response.send_message(embed=embed)
 
 
@@ -4387,6 +4745,7 @@ undoimport.error(_perm_error)
 backup_cmd.error(_perm_error)
 restore_cmd.error(_perm_error)
 togglerecentrate.error(_perm_error)
+toggleanimatedprofile.error(_perm_error)
 togglecompactleaderboard.error(_perm_error)
 setproratethreshold.error(_perm_error)
 addxprole.error(_perm_error)
@@ -4397,6 +4756,8 @@ settings_cmd.error(_perm_error)
 setbaseline.error(_perm_error)
 setbordercolor.error(_perm_error)
 removebordercolor.error(_perm_error)
+addbannertier.error(_perm_error)
+removebannertier.error(_perm_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
 setweekprogress.error(_perm_error)
