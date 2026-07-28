@@ -1,9 +1,9 @@
-# Terms of Service — [BOT NAME] (Discord Bot)
+# Terms of Service — UGG Tracker (Discord Bot)
 
-**Effective date:** [DATE]
-**Last updated:** [DATE]
+**Effective date:** 7/28/26
+**Last updated:** 7/28/26
 
-By adding [BOT NAME] ("the Bot") to a Discord server, or by using any of its commands, you agree to these Terms of Service ("Terms"). If you do not agree, do not add or use the Bot. The Bot is operated by [YOUR NAME / ORGANIZATION NAME] ("the Bot Operator," "we," "us").
+By adding UGG Tracker to a Discord server, or by using any of its commands, you agree to these Terms of Service . If you do not agree, do not add or use the Bot. The Bot is operated by Kelen McDonald ("the Bot Operator," "we," "us").
 
 These Terms work alongside — and do not replace — [Discord's Terms of Service](https://discord.com/terms), [Discord's Developer Policy](https://discord.com/developers/docs/policy), and [Discord's Community Guidelines](https://discord.com/guidelines), all of which continue to apply.
 
@@ -11,7 +11,7 @@ These Terms work alongside — and do not replace — [Discord's Terms of Servic
 
 ## 1. What the Bot does
 
-[BOT NAME] tracks self-reported Roblox XP progress for a Discord server's members, since it has no direct access to in-game data. It provides commands for recording XP, viewing progress and leaderboards, and (for server admins) configuring requirements, roles, schedules, and data management tools.
+UGG Tracker tracks self-reported Roblox XP progress for a Discord server's members, since it has no direct access to in-game data. It provides commands for recording XP, viewing progress and leaderboards, and (for server admins) configuring requirements, roles, schedules, and data management tools.
 
 ## 2. Eligibility
 
@@ -47,7 +47,7 @@ To the fullest extent permitted by law, the Bot Operator is not liable for any i
 
 ## 8. Data and privacy
 
-Our data practices are described in the [Privacy Policy]([PRIVACY POLICY URL]), which is incorporated into these Terms by reference.
+Our data practices are described in the [Privacy Policy](), which is incorporated into these Terms by reference.
 
 ## 9. Termination
 
@@ -61,9 +61,8 @@ We may update these Terms as the Bot's features change. Material changes will be
 
 Questions about these Terms can be sent to:
 
-**[YOUR CONTACT EMAIL]**
-or via [YOUR SUPPORT DISCORD SERVER / OTHER CONTACT METHOD]
+**kelentmcdonald@gmail.com**
 
 ---
 
-*This document is a template reflecting [BOT NAME]'s actual functionality as of the date above. It is not a substitute for legal advice — have it reviewed by a qualified professional before relying on it, particularly if you plan to monetize the Bot or operate it at larger scale.*
+*This document is a template reflecting UGG Tracker's actual functionality as of the date above. It is not a substitute for legal advice — have it reviewed by a qualified professional before relying on it, particularly if you plan to monetize the Bot or operate it at larger scale.*

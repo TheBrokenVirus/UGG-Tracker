@@ -1,9 +1,9 @@
-# Privacy Policy — [BOT NAME] (Discord Bot)
+# Privacy Policy — UGG Tracker (Discord Bot)
 
-**Effective date:** [DATE]
-**Last updated:** [DATE]
+**Effective date:** 7/28/26
+**Last updated:** 7/28/26
 
-This Privacy Policy explains what data [BOT NAME] ("the Bot," "we," "us") collects when a server adds it, how that data is stored and used, and what rights you have over it. This Bot is operated by [YOUR NAME / ORGANIZATION NAME] ("the Bot Operator").
+This Privacy Policy explains what data UGG Tracker ("the Bot," "we," "us") collects when a server adds it, how that data is stored and used, and what rights you have over it. This Bot is operated by Kelen McDonald ("the Bot Operator").
 
 This policy is written to be read alongside [Discord's own Privacy Policy](https://discord.com/privacy), which governs Discord itself. This policy only covers what the Bot specifically does.
 
@@ -11,7 +11,7 @@ This policy is written to be read alongside [Discord's own Privacy Policy](https
 
 ## 1. What this Bot does
 
-[BOT NAME] is an XP-tracking bot for Roblox game crews. Since the Bot cannot read game data directly, members self-report their XP totals using Discord slash commands (e.g. `/checkin`), and the Bot calculates progress, rates, and rankings from those self-reported numbers.
+UGG Tracker is an XP-tracking bot for Roblox game crews. Since the Bot cannot read game data directly, members self-report their XP totals using Discord slash commands (e.g. `/checkin`), and the Bot calculates progress, rates, and rankings from those self-reported numbers.
 
 ## 2. What data we collect
 
@@ -68,13 +68,11 @@ This Bot is intended for use in accordance with Discord's own Terms of Service, 
 
 Questions about this policy or requests regarding your data can be sent to:
 
-**[YOUR CONTACT EMAIL]**
-or via [YOUR SUPPORT DISCORD SERVER / OTHER CONTACT METHOD]
+**kelentmcdonald@gmail.com**
+
 
 ## 9. Changes to this policy
 
 We may update this policy as the Bot's features change. Material changes will be reflected by updating the "Last updated" date above. Continued use of the Bot after changes take effect constitutes acceptance of the updated policy.
 
 ---
-
-*This document is a template reflecting [BOT NAME]'s actual data practices as of the date above. It is not a substitute for legal advice — if your bot will process data from EU, UK, or California residents, or you plan to monetize it, have this reviewed by a qualified professional before relying on it.*

@@ -1,3 +1,7 @@
+
+[Privacy Policy](Privacy Policy.md)
+[Terms of Service](Terms of Service.md)
+
 # Roblox XP Tracker (Discord Bot)
 
 Tracks player XP manually via slash commands, since the bot has no direct
