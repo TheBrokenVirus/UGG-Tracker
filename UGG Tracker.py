@@ -12,6 +12,7 @@ Data is stored in a local JSON file (xp_data.json), scoped per-guild.
 
 import os
 import csv
+import copy
 import io
 import json
 from pathlib import Path
@@ -1250,6 +1251,51 @@ class ConfirmRemoveStaleView(discord.ui.View):
                 pass
 
 
+class ConfirmUndoImportView(discord.ui.View):
+    """Two-step confirmation for reverting an entire /importxp batch back
+    to how things were right before it ran."""
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Confirm — Undo Import", style=discord.ButtonStyle.danger, emoji="↩️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        snapshot = guild_data.get("last_import_snapshot")
+        for child in self.children:
+            child.disabled = True
+
+        if not snapshot:
+            await interaction.response.edit_message(content="Nothing to undo — no import snapshot found.", view=self)
+            return
+
+        guild_data["users"] = snapshot["users"]
+        guild_data["last_import_snapshot"] = None  # one-time undo — can't stack undos of undos
+        save_data(data)
+        await interaction.response.edit_message(
+            content="✅ Reverted to how tracking data looked before that import ran.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="Confirmation timed out — nothing was changed.", view=self)
+            except discord.HTTPException:
+                pass
+
+
 class UserActionView(discord.ui.View):
     """Shown after picking a user from UserSelectView — one-click actions for that user."""
 
@@ -2428,6 +2474,7 @@ async def exportdata(interaction: discord.Interaction, file_format: app_commands
 @app_commands.describe(
     file="A .csv or .xlsx file. Needs a column for XP (starting_xp/xp) and either discord_id or username",
     existing_users="What to do for users already being tracked (new users are always registered either way)",
+    announce_milestones="Post public milestone announcements for roles earned during this import (default: no, stay quiet)",
 )
 @app_commands.choices(existing_users=[
     app_commands.Choice(name="Skip them (default) — only register brand-new users", value="skip"),
@@ -2439,6 +2486,7 @@ async def importxp(
     interaction: discord.Interaction,
     file: discord.Attachment,
     existing_users: app_commands.Choice[str] = None,
+    announce_milestones: bool = False,
 ):
     mode = existing_users.value if existing_users else "skip"
     await interaction.response.defer(thinking=True)
@@ -2466,6 +2514,16 @@ async def importxp(
 
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
+
+    # Snapshot everyone's state BEFORE this import touches anything, so the
+    # whole batch can be reverted in one action via /undoimport — /undo only
+    # ever handles one person's most recent checkin at a time, which isn't
+    # enough to cleanly reverse a bulk import (especially "reset" mode,
+    # which replaces checkin history outright rather than appending to it).
+    guild_data["last_import_snapshot"] = {
+        "time": iso(utcnow()),
+        "users": copy.deepcopy(guild_data["users"]),
+    }
 
     created, checked_in, reset_list, skipped, unmatched, ambiguous, bad_rows = [], [], [], [], [], [], []
     roles_assigned_count = 0
@@ -2513,7 +2571,7 @@ async def importxp(
             create_user(guild_data, member.id, xp_val)
             created.append(f"{member.display_name} ({xp_val:,}){tag}")
 
-        role_result = await apply_xp_roles(guild, member, guild_data, xp_val, announce=False)
+        role_result = await apply_xp_roles(guild, member, guild_data, xp_val, announce=announce_milestones)
         roles_assigned_count += len(role_result["added"])
 
     save_data(data)
@@ -2548,13 +2606,48 @@ async def importxp(
             inline=False,
         )
     if roles_assigned_count:
+        announce_note = (
+            " Public announcements were posted for these."
+            if announce_milestones and get_announce_channel_id(guild_data)
+            else " Announcements stayed quiet for this import."
+        )
         embed.add_field(
             name="🎉 Milestone Roles Assigned",
-            value=f"{roles_assigned_count} role(s) granted based on configured XP thresholds.",
+            value=f"{roles_assigned_count} role(s) granted based on configured XP thresholds.{announce_note}",
             inline=False,
         )
-    embed.set_footer(text="Unmatched? Check the username matches their nickname/username, or add a discord_id column.")
+    embed.set_footer(text="Unmatched? Check the username matches their nickname/username, or add a discord_id column. Made a mistake? Run /undoimport to revert this entire batch.")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="undoimport", description="[Admin] Revert everyone's data back to how it looked before the last /importxp")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def undoimport(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    snapshot = guild_data.get("last_import_snapshot")
+
+    if not snapshot:
+        await interaction.response.send_message(
+            "No import to undo — either nothing's been imported yet, or the last import was already undone.",
+            ephemeral=True,
+        )
+        return
+
+    before_count = len(snapshot["users"])
+    after_count = len(guild_data["users"])
+    snapshot_time = int(parse_iso(snapshot["time"]).timestamp())
+
+    view = ConfirmUndoImportView(interaction.guild_id)
+    await interaction.response.send_message(
+        f"⚠️ This will revert **everyone's** tracking data back to how it looked "
+        f"<t:{snapshot_time}:R>, right before that import ran (currently **{after_count}** "
+        f"tracked, will become **{before_count}**). Anything anyone did *after* that import — "
+        f"checkins, corrections, role changes — will also be lost, not just the import itself. "
+        f"This can only undo the *one* most recent import. Continue?",
+        view=view,
+    )
+    view.message = await interaction.original_response()
 
 
 @bot.tree.command(
@@ -2974,6 +3067,7 @@ clearinactivitychannel.error(_perm_error)
 setinactivitythreshold.error(_perm_error)
 toggleleaderboardpagination.error(_perm_error)
 exportdata.error(_perm_error)
+undoimport.error(_perm_error)
 togglerecentrate.error(_perm_error)
 togglecompactleaderboard.error(_perm_error)
 setproratethreshold.error(_perm_error)

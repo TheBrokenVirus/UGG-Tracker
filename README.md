@@ -90,7 +90,8 @@ weekly requirement (default: 20,000 XP/week).
 | `/setinactivitythreshold days: hours: minutes:` | Admin | How long before week-end the inactivity ping fires (default: 24 hours). |
 | `/toggleleaderboardpagination enabled:<true/false>` | Admin | Switch leaderboards between Previous/Next paging and the default single truncated embed. |
 | `/setbaseline user:<@user> starting_xp:<number>` | Admin | Set or correct someone's all-time starting XP — this is what `/totalleaderboard` calculates total gain from. |
-| `/importxp file:<.csv or .xlsx> [existing_users]` | Admin | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. See below. |
+| `/importxp file:<.csv or .xlsx> [existing_users] [announce_milestones]` | Admin | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. `announce_milestones` (default: no) controls whether XP role milestones hit during this import get posted publicly. See below. |
+| `/undoimport` | Admin | Reverts **everyone's** data back to exactly how it looked right before the last `/importxp` ran — the only way to undo a whole batch at once, since `/undo` only handles one person's most recent checkin at a time. Only reverts the single most recent import. |
 | `/fullreset user:<@user> [clear_history]` | Admin | Reset **both** weekly and all-time totals at once, starting fresh from their current XP. `clear_history: true` (default) also wipes their stored checkin history. Unlike `/removeuser`, they stay registered — no need to re-checkin to restart tracking. |
 | `/resetweek user:<@user>` | Admin | Manually restart someone's weekly window right now (0 days elapsed). |
 | `/setweekprogress user:<@user> [days] [hours] [minutes] [week_start_xp]` | Admin | Manually set how far into the week someone is, in plain days/hours/minutes (e.g. `days: 3, hours: 12` treats them as if their week started 3.5 days ago). Optionally also override their starting XP for the week. |
@@ -159,9 +160,11 @@ You only need `discord_id` **or** `username` per row, not both — `discord_id` 
 - **Check in** — treats the imported XP as a fresh checkin for existing users, exactly like they ran `/checkin` themselves. Their baseline, weekly progress, and checkin history all stay intact — this is the one to use for a routine bulk update (e.g. "here's everyone's current XP from this week's screenshots"), acting as a mass check-in instead of a reset.
 - **Reset** — wipes and restarts existing users' tracking, same as `/fullreset`. Use this for a genuine do-over, not routine updates — it discards their history.
 
-New users are always registered regardless of which option you pick for existing ones.
+New users are always registered regardless of which option you pick for existing ones. If you have XP milestone roles configured (see "XP milestone roles" below) and want a public announcement for anyone who hits one during this import, set `announce_milestones: true` — it defaults to `false` so a routine bulk update doesn't spam the announcement channel.
 
 **4. Check the results** — the bot replies with a summary: how many were newly tracked, skipped, **ambiguous** (matched more than one member), or **unmatched**. For unmatched rows, double-check the spelling matches what's actually in their nickname; for ambiguous ones, add a `discord_id` for those specific rows. Either way, you can always patch up the leftovers manually with `/setbaseline`.
+
+**Undoing an import**: `/undo` (the regular per-person command) is *not* the right tool for reverting a bulk import — it only touches one person's single most recent checkin, and after `existing_users: Reset` there's no prior checkin left to revert to; `/undo` would just delete that person's tracking entirely rather than restore their pre-import numbers. For reverting the whole batch correctly — including recovering history that a "Reset" import wiped out — use `/undoimport` instead, which restores everyone's data to exactly how it looked right before that import ran. It can only undo the single most recent import (not a chain of several), and running a second import overwrites the ability to undo the first.
 
 ## XP milestone roles
 
@@ -233,7 +236,7 @@ Chart generation depends on the `matplotlib` package (already in `requirements.t
 
 Once set, the bot posts a congratulations message to that channel whenever someone **earns a new XP milestone role** (see "XP milestone roles" above) — e.g. "@Someone just earned @Veteran!" Only role *additions* trigger an announcement, never removals (so someone getting demoted between tiers doesn't generate an awkward public message).
 
-**Bulk operations stay quiet on purpose.** If you import 50 people at once via `/importxp`, retroactively grant a newly-added role with `/addxprole`, or run `/syncxproles`, none of those post individual announcements — only an organic `/checkin` does. Otherwise a big import would flood the announcement channel with dozens of messages at once. Those bulk commands still report their own summary (e.g. "X roles granted") in their normal response, just not as separate public posts per person.
+**Bulk operations stay quiet by default, on purpose.** Retroactively granting a newly-added role with `/addxprole`, running `/syncxproles`, and importing via `/importxp` all skip individual announcements by default — otherwise a big batch would flood the channel with dozens of messages at once. `/addxprole`'s retroactive grants and `/syncxproles` always stay quiet (they report their own summary instead, e.g. "X roles granted"). `/importxp` is the one exception: it has an `announce_milestones` toggle if you *do* want a public post for every milestone hit during that specific import — useful for a big "everyone's XP is now official" batch update where you want the celebration, not just for routine data corrections.
 
 Run `/clearannouncechannel` to turn announcements off again.
 
