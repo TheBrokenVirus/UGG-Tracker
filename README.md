@@ -294,6 +294,10 @@ Chart generation depends on the `matplotlib` package (already in `requirements.t
 
 Renders an image card — avatar with a colored ring, name, rank, Crew XP, this week's gain, and a progress bar toward the weekly requirement — instead of a plain text embed. Rank is calculated the same way as `/totalleaderboard`: by actual total XP, so it includes each person's starting point, not just XP gained while tracked.
 
+If any XP milestone roles are configured (see "XP milestone roles" below), the card also shows how much XP is needed for the next one not yet reached — e.g. "4,784 XP to Gold". Rank #1 gets a small gold star and accent color instead of their assigned border color, so the top spot stands out. The card is rendered at 3x resolution and downscaled for smooth, anti-aliased edges rather than the jagged look raw drawing would otherwise produce, and the background has a subtle gradient tinted with the person's border color for extra visual polish without being distracting.
+
+**Daily rank change** — next to the rank, the card shows how much someone's rank has moved since the last daily snapshot: ▲2 in green for climbing, ▼1 in red for dropping, or — for no change. A background task takes one snapshot per UTC day for every server with tracked users (no shared week required for this specific feature, unlike the scheduled post and inactivity pings). The indicator only appears once at least one snapshot has happened — a server's very first day using the bot won't show a rank-change badge yet, since there's nothing to compare against.
+
 **Border colors are a cosmetic perk, currently assigned by admins:**
 
 ```

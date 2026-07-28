@@ -43,7 +43,7 @@ except ImportError:
     plt = None
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
 except ImportError:
     Image = None
 
@@ -141,6 +141,7 @@ def default_guild_data() -> dict:
         "inactivity_include_behind_pace": False,
         "leaderboard_pagination": False,
         "admin_log_channel_id": None,
+        "last_rank_snapshot_date": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -906,22 +907,47 @@ def get_border_color(entry: dict) -> str:
     won't have a border_color key."""
     return entry.get("border_color", DEFAULT_BORDER_COLOR)
 
+def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
+    """Compares current rank against the most recent daily snapshot
+    (see scheduled_checks). Positive = moved up (better rank, lower
+    number); negative = dropped. Returns None if no snapshot exists yet
+    (e.g. brand new server, or the daily task hasn't run since setup)."""
+    daily_rank = entry.get("daily_rank")
+    if daily_rank is None:
+        return None
+    return daily_rank - current_rank
+
 async def build_profile_card(
     member: discord.abc.User, entry: dict, stats: dict, requirement: int, rank: int, total_members: int,
+    next_milestone: Optional[tuple] = None, rank_change: Optional[int] = None,
 ) -> Optional[io.BytesIO]:
-    """Renders a profile card PNG: avatar with a colored ring, name, rank,
-    Crew XP, this week's gain, and a weekly-progress bar — all in the
-    member's assigned border color. Returns None if Pillow isn't installed."""
+    """Renders a profile card PNG: avatar with a colored ring, name, rank
+    (with a daily rank-change indicator), Crew XP, this week's gain, and a
+    weekly-progress bar — all in the member's assigned border color, over
+    a subtly tinted background gradient. next_milestone, if given, is
+    (xp_needed, role_name) for the next XP-ladder role not yet reached.
+    rank_change, if given, is current-vs-yesterday's-snapshot rank
+    movement (positive = moved up). Returns None if Pillow isn't installed.
+
+    Rendered at 3x resolution and downscaled with a smoothing filter
+    (supersampling) — PIL doesn't anti-alias its own drawing, so every
+    curved edge (border, avatar ring, progress bar) would otherwise look
+    jagged at the final size. This trades a bit of render time for
+    noticeably smoother output."""
     if Image is None:
         return None
 
-    CARD_W, CARD_H = 900, 300
+    SCALE = 3
+    CARD_W, CARD_H = 900 * SCALE, 300 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
     WHITE = (245, 246, 248, 255)
     BAR_BG = (58, 61, 66, 255)
     ON_TRACK_GREEN = (99, 209, 129, 255)
     BEHIND_ORANGE = (240, 170, 80, 255)
+    GOLD_ACCENT = (255, 215, 0, 255)
+    RANK_UP_GREEN = (99, 209, 129, 255)
+    RANK_DOWN_RED = (230, 90, 90, 255)
 
     border_hex = get_border_color(entry)
     border_rgb = _hex_to_rgb(border_hex) + (255,)
@@ -933,57 +959,104 @@ async def build_profile_card(
     except (discord.HTTPException, discord.NotFound):
         avatar_img = Image.new("RGBA", (256, 256), (88, 101, 242, 255))
 
+    # Subtle background gradient — a gentle tint of the border color fading
+    # in from the left (where the colored avatar ring is) toward plain
+    # background on the right. Uses Pillow's built-in gradient generator
+    # (no numpy dependency) as an alpha mask between two solid-color
+    # layers, then clips it to the card's rounded-corner shape.
+    def _tint(base_rgb, accent_rgb, ratio):
+        return tuple(int(base_rgb[i] * (1 - ratio) + accent_rgb[i] * ratio) for i in range(3))
+
+    tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
+    bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
+    bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
+    grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
+    bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+
+    corner_mask = Image.new("L", (CARD_W, CARD_H), 0)
+    ImageDraw.Draw(corner_mask).rounded_rectangle([0, 0, CARD_W - 1, CARD_H - 1], radius=24 * SCALE, fill=255)
     card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    card.paste(bg_gradient, (0, 0), corner_mask)
     draw = ImageDraw.Draw(card)
 
-    draw.rounded_rectangle([0, 0, CARD_W - 1, CARD_H - 1], radius=24, fill=BG_COLOR)
-    draw.rounded_rectangle([4, 4, CARD_W - 5, CARD_H - 5], radius=22, outline=border_rgb, width=8)
+    draw.rounded_rectangle(
+        [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
+        radius=22 * SCALE, outline=border_rgb, width=8 * SCALE,
+    )
 
-    avatar_size = 200
-    avatar_pos = (35, (CARD_H - avatar_size) // 2)
-    avatar_img = avatar_img.resize((avatar_size, avatar_size))
+    avatar_size = 200 * SCALE
+    avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
+    avatar_img = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
     mask = Image.new("L", (avatar_size, avatar_size), 0)
     ImageDraw.Draw(mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
-    ring_pad = 6
+    ring_pad = 6 * SCALE
     draw.ellipse(
         [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
          avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
-        outline=border_rgb, width=5,
+        outline=border_rgb, width=5 * SCALE,
     )
     card.paste(avatar_img, avatar_pos, mask)
 
-    text_x = 35 + avatar_size + 45
-    font_name = _find_profile_font(True, 42)
-    font_rank = _find_profile_font(True, 22)
-    font_stat_label = _find_profile_font(False, 18)
-    font_stat_value = _find_profile_font(True, 26)
-    font_bar_label = _find_profile_font(False, 14)
+    text_x = 35 * SCALE + avatar_size + 45 * SCALE
+    font_name = _find_profile_font(True, 42 * SCALE)
+    font_rank = _find_profile_font(True, 27 * SCALE)
+    font_change = _find_profile_font(True, 20 * SCALE)
+    font_stat_label = _find_profile_font(False, 18 * SCALE)
+    font_stat_value = _find_profile_font(True, 26 * SCALE)
+    font_bar_label = _find_profile_font(False, 14 * SCALE)
 
     display_name = member.display_name
     if len(display_name) > 20:
         display_name = display_name[:19] + "…"
-    draw.text((text_x, 42), display_name, font=font_name, fill=WHITE)
-    draw.text((text_x, 100), f"Rank #{rank} of {total_members}", font=font_rank, fill=border_rgb)
+    draw.text((text_x, 42 * SCALE), display_name, font=font_name, fill=WHITE)
 
-    stat_y = 150
+    rank_line = f"Rank #{rank} of {total_members}"
+    if rank == 1:
+        rank_line = "★ " + rank_line
+    rank_color = GOLD_ACCENT if rank == 1 else border_rgb
+    draw.text((text_x, 100 * SCALE), rank_line, font=font_rank, fill=rank_color)
+
+    if rank_change is not None:
+        change_x = text_x + draw.textlength(rank_line, font=font_rank) + 14 * SCALE
+        change_y = 100 * SCALE + 4 * SCALE
+        if rank_change > 0:
+            draw.text((change_x, change_y), f"▲{rank_change}", font=font_change, fill=RANK_UP_GREEN)
+        elif rank_change < 0:
+            draw.text((change_x, change_y), f"▼{abs(rank_change)}", font=font_change, fill=RANK_DOWN_RED)
+        else:
+            draw.text((change_x, change_y), "—", font=font_change, fill=MUTED_TEXT)
+
+    if next_milestone:
+        needed, role_name = next_milestone
+        milestone_font = _find_profile_font(False, 16 * SCALE)
+        draw.text(
+            (text_x, 132 * SCALE), f"{needed:,} XP to {role_name}",
+            font=milestone_font, fill=MUTED_TEXT,
+        )
+
+    stat_y = 165 * SCALE
     draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
-    draw.text((text_x, stat_y + 24), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
+    draw.text((text_x, stat_y + 24 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
 
-    stat_x2 = text_x + 280
+    stat_x2 = text_x + 280 * SCALE
     draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
     week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
-    draw.text((stat_x2, stat_y + 24), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+    draw.text((stat_x2, stat_y + 24 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
 
-    bar_x, bar_y = text_x, 230
-    bar_w, bar_h = CARD_W - text_x - 40, 22
+    bar_x, bar_y = text_x, 245 * SCALE
+    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 22 * SCALE
     effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
     pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
-    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=11, fill=BAR_BG)
+    draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=11 * SCALE, fill=BAR_BG)
     if pct > 0:
         fill_w = max(int(bar_w * pct), bar_h)
-        draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=11, fill=border_rgb)
-    draw.text((bar_x, bar_y - 20), f"Weekly progress — {pct * 100:.0f}%", font=font_bar_label, fill=MUTED_TEXT)
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=11 * SCALE, fill=border_rgb)
+    draw.text(
+        (bar_x, bar_y - 20 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
+        font=font_bar_label, fill=MUTED_TEXT,
+    )
 
+    card = card.resize((900, 300), Image.LANCZOS)  # downscale — this is what smooths every edge
     buf = io.BytesIO()
     card.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
@@ -2192,28 +2265,43 @@ WEEKLY_POST_WINDOW = timedelta(minutes=SCHEDULER_INTERVAL_MINUTES + 5)
 
 @tasks.loop(minutes=SCHEDULER_INTERVAL_MINUTES)
 async def scheduled_checks():
-    """Runs periodically for every guild the bot is in, checking two
-    independent things — both only apply to guilds with a shared week
-    (set via /setweekprogressall), since neither has a single meaningful
-    trigger moment without one:
+    """Runs periodically for every guild the bot is in, checking three
+    independent things:
 
-    1. Scheduled weekly leaderboard post — fires once, shortly BEFORE the
+    1. Daily rank snapshot — records each tracked user's current rank
+       once per UTC day, so /profile can show how their rank has moved
+       since the last snapshot. Runs for every guild with tracked users,
+       regardless of whether a shared week is set up.
+    2. Scheduled weekly leaderboard post — fires once, shortly BEFORE the
        week actually rolls over, so it captures the week's final results
        rather than the just-reset (near-zero) numbers of the new week.
-    2. Inactivity ping — fires once per week when the configured amount
+       Requires a shared week (set via /setweekprogressall).
+    3. Inactivity ping — fires once per week when the configured amount
        of time remains before the week ends, listing anyone with zero
-       checkins so far that week.
+       checkins so far that week. Also requires a shared week.
 
-    Each fires at most once per week per guild, tracked via a marker
-    storing which week's boundary it already handled."""
+    The weekly post and inactivity ping each fire at most once per week
+    per guild, tracked via a marker storing which week's boundary they
+    already handled — neither has a single meaningful trigger moment
+    without a shared week to measure against."""
     data = load_data()
     changed = False
 
     for guild in bot.guilds:
         guild_data = get_guild(data, guild.id)
+
+        # --- Daily rank snapshot (works for every guild, no shared week needed) ---
+        today_str = utcnow().strftime("%Y-%m-%d")
+        if guild_data["users"] and guild_data.get("last_rank_snapshot_date") != today_str:
+            ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
+            for i, (uid, entry) in enumerate(ranked, start=1):
+                entry["daily_rank"] = i
+            guild_data["last_rank_snapshot_date"] = today_str
+            changed = True
+
         anchor = guild_data.get("week_anchor")
         if not anchor:
-            continue  # both features need a shared week to have one clear trigger moment
+            continue  # the weekly post and inactivity ping need a shared week to have one clear trigger moment
 
         week_start = parse_iso(anchor)
         now = utcnow()
@@ -2727,7 +2815,21 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
     save_data(data)  # persist any lazy rollover triggered by compute_stats
 
-    card_buf = await build_profile_card(target, entry, stats, guild_data["requirement"], rank, total_members)
+    # Find the next un-reached exclusive-ladder XP role, if any are configured
+    next_milestone = None
+    exclusive_roles = [m for m in get_xp_roles(guild_data) if m["exclusive"] and m["xp"] > entry["current_xp"]]
+    if exclusive_roles:
+        next_mapping = exclusive_roles[0]  # get_xp_roles() returns them sorted ascending
+        role_obj = interaction.guild.get_role(next_mapping["role_id"])
+        role_name = role_obj.name if role_obj else "the next tier"
+        next_milestone = (next_mapping["xp"] - entry["current_xp"], role_name)
+
+    rank_change = get_rank_change(entry, rank)
+
+    card_buf = await build_profile_card(
+        target, entry, stats, guild_data["requirement"], rank, total_members,
+        next_milestone=next_milestone, rank_change=rank_change,
+    )
     file = discord.File(fp=card_buf, filename="profile.png")
     await interaction.followup.send(file=file)
 
