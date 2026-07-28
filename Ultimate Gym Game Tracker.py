@@ -902,6 +902,18 @@ def _hex_to_rgb(hex_str: str) -> tuple:
     hex_str = hex_str.lstrip("#")
     return tuple(int(hex_str[i:i + 2], 16) for i in (0, 2, 4))
 
+def _fit_text_to_width(draw: "ImageDraw.ImageDraw", text: str, font, max_width: float) -> str:
+    """Truncates text with a trailing ellipsis so it fits max_width when
+    rendered in font — measured by actual pixel width, not character
+    count. A fixed character-count cutoff was letting some names overflow
+    (wide characters like 'W'/'M') while unnecessarily trimming others
+    (narrow characters like 'i'/'l')."""
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+    while text and draw.textlength(text + "…", font=font) > max_width:
+        text = text[:-1]
+    return (text + "…") if text else "…"
+
 def get_border_color(entry: dict) -> str:
     """Backward-compatible getter — entries created before this feature
     won't have a border_color key."""
@@ -937,7 +949,15 @@ async def build_profile_card(
     if Image is None:
         return None
 
-    SCALE = 3
+    # Rendered at a higher factor than the final shipped size (see resize
+    # at the bottom): SCALE controls anti-aliasing quality during drawing,
+    # FINAL_W/FINAL_H controls what actually gets sent to Discord. Shipping
+    # only 900x300 looked blurry in Discord's inline chat preview, since
+    # Discord shrinks it further for that thumbnail and there wasn't
+    # enough source detail left to survive being displayed small — a
+    # higher native resolution fixes that without changing the design.
+    SCALE = 5
+    FINAL_W, FINAL_H = 1350, 450
     CARD_W, CARD_H = 900 * SCALE, 300 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
@@ -1005,9 +1025,8 @@ async def build_profile_card(
     font_stat_value = _find_profile_font(True, 26 * SCALE)
     font_bar_label = _find_profile_font(False, 14 * SCALE)
 
-    display_name = member.display_name
-    if len(display_name) > 20:
-        display_name = display_name[:19] + "…"
+    max_name_width = CARD_W - text_x - 40 * SCALE  # same right margin used by the bar/stats below
+    display_name = _fit_text_to_width(draw, member.display_name, font_name, max_name_width)
     draw.text((text_x, 42 * SCALE), display_name, font=font_name, fill=WHITE)
 
     rank_line = f"Rank #{rank} of {total_members}"
@@ -1056,7 +1075,7 @@ async def build_profile_card(
         font=font_bar_label, fill=MUTED_TEXT,
     )
 
-    card = card.resize((900, 300), Image.LANCZOS)  # downscale — this is what smooths every edge
+    card = card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
     buf = io.BytesIO()
     card.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
