@@ -3188,7 +3188,10 @@ async def scheduled_checks():
                 )
                 if embed:
                     try:
-                        await channel.send(embed=embed, view=view)
+                        if view:
+                            await channel.send(embed=embed, view=view)
+                        else:
+                            await channel.send(embed=embed)
                     except discord.HTTPException:
                         pass
             guild_data["last_weekly_post_marker"] = week_marker
@@ -3346,7 +3349,10 @@ async def store_cmd(interaction: discord.Interaction):
     else:
         embed.set_footer(text="Store link not set up yet — an admin can add one with /setstoreurl.")
 
-    await interaction.response.send_message(embed=embed, view=view)
+    if view is not None:
+        await interaction.response.send_message(embed=embed, view=view)
+    else:
+        await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="checkin", description="Record current total Roblox XP — yours, or (admin) someone else's")
@@ -3790,7 +3796,10 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
     # when no tier applies — a tier's look is fixed by design (see
     # /addbannertier), so there's nothing to pick from a dropdown there.
     view = ProfileCustomizeView(interaction.guild_id, target.id) if (target.id == interaction.user.id and banner is None) else None
-    await interaction.followup.send(file=file, view=view)
+    if view is not None:
+        await interaction.followup.send(file=file, view=view)
+    else:
+        await interaction.followup.send(file=file)
 
 
 @bot.tree.command(name="undo", description="Remove the most recent checkin (yours, or someone else's if you're an admin)")
