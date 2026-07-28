@@ -1,0 +1,15 @@
+# Secrets — never commit your bot token
+.env
+
+# Local data — this is per-deployment, not source code
+xp_data.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS clutter
+.DS_Store
+Thumbs.db
