@@ -148,6 +148,7 @@ def default_guild_data() -> dict:
         "store_products": [],
         "animated_profiles": True,
         "banner_tiers": [],
+        "sku_roles": {},
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -1029,6 +1030,16 @@ def get_member_banner_tier(guild_data: dict, member: discord.Member) -> Optional
     member_role_ids = {r.id for r in member.roles}
     qualifying = [t for t in tiers if t["role_id"] in member_role_ids]
     return qualifying[-1] if qualifying else None  # ascending sort, so last = highest priority
+
+def get_sku_roles(guild_data: dict) -> dict:
+    """Backward-compatible getter — older guild entries won't have this
+    key. Returns {sku_id_str: {"role_id": int, "name": str}} — this
+    server's mapping of Discord Monetization SKU IDs to the role granted
+    while a member holds an active entitlement for that SKU. Combine this
+    with /addbannertier on the same role to make a purchase automatically
+    unlock a banner look too — the two systems aren't directly linked in
+    code, they just both key off the same role."""
+    return guild_data.get("sku_roles", {})
 
 def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
     """Compares current rank against the most recent daily snapshot
@@ -2158,6 +2169,11 @@ HELP_CATEGORIES = [
         ("/removebannertier role:<@role>", "Remove a role's banner tier"),
         ("/listbannertiers", "Show all configured banner tiers"),
     ]),
+    ("admin_skus", "Admin: SKU Role Automation", "🛒", "Auto-granting roles for Discord purchases/subscriptions", [
+        ("/addskurole sku_id: role: name:", "Auto-grant a role while a SKU entitlement is active"),
+        ("/removeskurole sku_id:<id>", "Stop auto-granting a role for a SKU"),
+        ("/listskuroles", "Show all configured SKU → role mappings"),
+    ]),
     ("admin_display", "Admin: Display", "🎨", "How leaderboards and status look", [
         ("/togglerecentrate enabled:", "Show/hide the \"Recent Rate\" field"),
         ("/togglecompactleaderboard enabled:", "Short vs. full-detail leaderboard entries"),
@@ -2688,6 +2704,153 @@ SCHEDULER_INTERVAL_MINUTES = 15
 WEEKLY_POST_WINDOW = timedelta(minutes=SCHEDULER_INTERVAL_MINUTES + 5)
 
 
+# ---------------------------------------------------------------------------
+# Store SKU → role automation (Discord Monetization: purchases/subscriptions)
+# ---------------------------------------------------------------------------
+# Grants/removes a role based on whether a member currently holds an active
+# Discord entitlement for a mapped SKU — see /addskurole. Two layers work
+# together:
+#   1. Gateway events (on_entitlement_create/delete/update) react within
+#      seconds of a purchase, cancellation, or refund.
+#   2. reconcile_sku_roles (below) re-derives the truth from Discord's own
+#      entitlement list once an hour and corrects any drift — this is what
+#      actually guarantees roles get removed when a subscription ends,
+#      since Discord doesn't replay missed gateway events from downtime,
+#      and a subscription lapsing from non-renewal doesn't necessarily fire
+#      a clean on_entitlement_delete at the exact moment access ends.
+# Requires discord.py 2.4+ (Entitlement/SKU support) and a bot application
+# with Monetization set up in the Developer Portal.
+
+async def _apply_sku_entitlement(entitlement: discord.Entitlement, grant: bool):
+    """Grants (or revokes) the role mapped to this entitlement's SKU, in
+    every guild that has a mapping for it and where the entitled user is
+    a member. Guild-wide entitlements (no specific user_id) are skipped —
+    there's no single member to act on."""
+    if entitlement.user_id is None:
+        return
+    data = load_data()
+    changed = False
+    for guild in bot.guilds:
+        guild_data = get_guild(data, guild.id)
+        mapping = get_sku_roles(guild_data).get(str(entitlement.sku_id))
+        if not mapping:
+            continue
+        member = guild.get_member(entitlement.user_id)
+        role = guild.get_role(mapping["role_id"]) if member else None
+        if not member or not role:
+            continue
+        try:
+            if grant and role not in member.roles:
+                await member.add_roles(role, reason=f"SKU {entitlement.sku_id} entitlement active")
+                await log_admin_action(
+                    guild, guild_data, bot.user, "Auto-granted role (purchase)",
+                    target=member.mention, details=f"SKU `{entitlement.sku_id}` ({mapping['name']})",
+                )
+                changed = True
+            elif not grant and role in member.roles:
+                await member.remove_roles(role, reason=f"SKU {entitlement.sku_id} entitlement ended")
+                await log_admin_action(
+                    guild, guild_data, bot.user, "Auto-removed role (subscription ended)",
+                    target=member.mention, details=f"SKU `{entitlement.sku_id}` ({mapping['name']})",
+                )
+                changed = True
+        except discord.Forbidden:
+            pass  # bot lacks Manage Roles or sits below the role in the hierarchy
+    if changed:
+        save_data(data)
+
+
+@bot.event
+async def on_entitlement_create(entitlement: discord.Entitlement):
+    """Fired when someone purchases a SKU (one-time) or starts a
+    subscription — grants the mapped role right away."""
+    await _apply_sku_entitlement(entitlement, grant=True)
+
+
+@bot.event
+async def on_entitlement_delete(entitlement: discord.Entitlement):
+    """Fired on a refund, or when Discord otherwise removes an
+    entitlement outright — removes the mapped role right away. Note this
+    is NOT reliably fired for a subscription simply lapsing at the end of
+    its billing period after cancellation; reconcile_sku_roles catches
+    that case within the hour instead."""
+    await _apply_sku_entitlement(entitlement, grant=False)
+
+
+@bot.event
+async def on_entitlement_update(entitlement: discord.Entitlement):
+    """Fired when an entitlement changes — most notably, when a member
+    cancels a subscription: they keep access until the current billing
+    period ends, and this fires with ends_at set to that moment rather
+    than removing access immediately. If that moment has already passed
+    by the time we see it, treat it as ended now; otherwise leave the
+    role alone and let it fall out on its own — reconcile_sku_roles will
+    remove it once Discord actually excludes the entitlement as ended."""
+    if entitlement.ends_at is not None and entitlement.ends_at <= utcnow():
+        await _apply_sku_entitlement(entitlement, grant=False)
+
+
+@tasks.loop(hours=1)
+async def reconcile_sku_roles():
+    """Safety net described above: fetches every currently-active
+    entitlement for the application and corrects any drift between that
+    and who actually holds each mapped role — adding roles for
+    entitlements that arrived while the bot was offline, and removing
+    roles for entitlements that have since ended (including subscriptions
+    that lapsed after cancellation, which the gateway events alone can't
+    fully cover)."""
+    if bot.application_id is None:
+        return
+    try:
+        active = [e async for e in bot.entitlements(exclude_ended=True, limit=None)]
+    except discord.HTTPException:
+        return
+
+    active_by_user: dict = {}
+    for e in active:
+        if e.user_id is not None:
+            active_by_user.setdefault(e.user_id, set()).add(e.sku_id)
+
+    data = load_data()
+    changed = False
+    for guild in bot.guilds:
+        guild_data = get_guild(data, guild.id)
+        sku_roles = get_sku_roles(guild_data)
+        if not sku_roles:
+            continue
+        for sku_id_str, mapping in sku_roles.items():
+            sku_id = int(sku_id_str)
+            role = guild.get_role(mapping["role_id"])
+            if not role:
+                continue
+            # Remove from anyone holding the role without a matching active entitlement.
+            for member in list(role.members):
+                if sku_id not in active_by_user.get(member.id, set()):
+                    try:
+                        await member.remove_roles(role, reason="Subscription entitlement ended (reconciliation)")
+                        changed = True
+                    except discord.Forbidden:
+                        pass
+            # Add to anyone with an active entitlement who's missing the role.
+            for user_id, sku_ids in active_by_user.items():
+                if sku_id not in sku_ids:
+                    continue
+                member = guild.get_member(user_id)
+                if member and role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason="Subscription entitlement active (reconciliation)")
+                        changed = True
+                    except discord.Forbidden:
+                        pass
+    if changed:
+        save_data(data)
+
+
+@reconcile_sku_roles.before_loop
+async def before_reconcile_sku_roles():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(minutes=SCHEDULER_INTERVAL_MINUTES)
 async def scheduled_checks():
     """Runs periodically for every guild the bot is in, checking three
@@ -2864,6 +3027,8 @@ async def on_ready():
         scheduled_checks.start()
     if not rotate_presence.is_running():
         rotate_presence.start()
+    if not reconcile_sku_roles.is_running():
+        reconcile_sku_roles.start()
 
 
 # ---------------------------------------------------------------------------
@@ -4441,6 +4606,88 @@ async def listbannertiers(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="addskurole",
+    description="[Admin] Auto-grant a role while a member has an active purchase/subscription for this SKU",
+)
+@app_commands.describe(
+    sku_id="The SKU's ID from the Discord Developer Portal's Monetization page",
+    role="Role to grant while the member's entitlement for this SKU is active, and remove once it ends",
+    name="A short label for your own reference (e.g. 'Elite Monthly') — shown in /listskuroles",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def addskurole(interaction: discord.Interaction, sku_id: str, role: discord.Role, name: str):
+    cleaned_sku = sku_id.strip()
+    if not cleaned_sku.isdigit():
+        await interaction.response.send_message(
+            "That doesn't look like a valid SKU ID — it should be a numeric ID from the Developer Portal's "
+            "Monetization page, not a product name.", ephemeral=True,
+        )
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    sku_roles = guild_data.setdefault("sku_roles", {})
+    sku_roles[cleaned_sku] = {"role_id": role.id, "name": name}
+    save_data(data)
+
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Added SKU → role mapping",
+        target=role.mention, details=f"SKU `{cleaned_sku}` ({name})",
+    )
+    await interaction.response.send_message(
+        f"Members with an active entitlement for SKU `{cleaned_sku}` (**{name}**) will now automatically get "
+        f"{role.mention} — and lose it once that entitlement ends. This applies going forward and is also "
+        f"caught up by an hourly reconciliation pass, so it covers purchases made while the bot was offline too."
+    )
+
+
+@bot.tree.command(name="removeskurole", description="[Admin] Stop auto-granting a role for a SKU")
+@app_commands.describe(sku_id="The SKU ID to remove the mapping for")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def removeskurole(interaction: discord.Interaction, sku_id: str):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    sku_roles = guild_data.setdefault("sku_roles", {})
+    removed = sku_roles.pop(sku_id.strip(), None)
+    if removed is None:
+        await interaction.response.send_message(f"No mapping found for SKU `{sku_id}`.", ephemeral=True)
+        return
+    save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Removed SKU → role mapping",
+        details=f"SKU `{sku_id}` ({removed['name']})",
+    )
+    await interaction.response.send_message(
+        f"Stopped auto-granting a role for SKU `{sku_id}` (**{removed['name']}**). "
+        f"This doesn't strip the role from anyone who already has it — remove that manually if needed."
+    )
+
+
+@bot.tree.command(name="listskuroles", description="[Admin] Show all configured SKU → role mappings")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def listskuroles(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    sku_roles = get_sku_roles(guild_data)
+
+    if not sku_roles:
+        await interaction.response.send_message(
+            "No SKU → role mappings configured yet. Add one with `/addskurole`.", ephemeral=True
+        )
+        return
+
+    lines = [
+        f"**{mapping['name']}** — SKU `{sku_id}` → <@&{mapping['role_id']}>"
+        for sku_id, mapping in sku_roles.items()
+    ]
+    embed = discord.Embed(
+        title="🛒 SKU → Role Mappings", description="\n".join(lines), color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Roles are granted/removed automatically as entitlements start and end.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
     name="setbaseline",
     description="[Admin] Set or correct a user's all-time starting XP (used for the total leaderboard)",
 )
@@ -4758,6 +5005,9 @@ setbordercolor.error(_perm_error)
 removebordercolor.error(_perm_error)
 addbannertier.error(_perm_error)
 removebannertier.error(_perm_error)
+addskurole.error(_perm_error)
+removeskurole.error(_perm_error)
+listskuroles.error(_perm_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
 setweekprogress.error(_perm_error)

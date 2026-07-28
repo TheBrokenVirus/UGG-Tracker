@@ -92,6 +92,9 @@ weekly requirement (default: 20,000 XP/week).
 | `/addbannertier role: name: mode: color1: [color2] priority:` | Admin | Ties a profile banner look to a role — e.g. a role your store/Ko-fi integration grants on purchase. See "Banner tiers" below. |
 | `/removebannertier role:<@role>` | Admin | Removes a role's banner tier. |
 | `/listbannertiers` | Everyone | Shows all configured banner tiers, their roles, and their colors. |
+| `/addskurole sku_id: role: name:` | Admin | Auto-grants a role while a member has an active Discord purchase/subscription for a SKU, and removes it when that ends. See "SKU role automation" below. |
+| `/removeskurole sku_id:<id>` | Admin | Stops auto-granting a role for a SKU. |
+| `/listskuroles` | Admin | Shows all configured SKU → role mappings. |
 | `/exportdata [file_format]` | Admin | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
 | `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
@@ -336,6 +339,26 @@ If a member holds roles for more than one tier (e.g. they kept an old role after
 
 Card rendering depends on the `Pillow` package (already in `requirements.txt`). If it's somehow missing, `/profile` explains what to install rather than crashing. Font rendering automatically adapts to whatever's available on the host — it checks common Linux, Windows, and macOS font locations and falls back to a built-in font if none are found, so the card looks right on your Windows PC during testing and on whatever you eventually host it on.
 
+## SKU role automation (Discord purchases & subscriptions)
+
+```
+/addskurole sku_id:1234567890123456789 role:@Supporter name:"Supporter"
+/addskurole sku_id:9876543210987654321 role:@Elite name:"Elite Monthly"
+```
+
+If you're selling through **Discord's own Monetization system** (SKUs configured in the Developer Portal — one-time purchases or subscriptions bought right inside Discord, not through an external site), the bot can grant and remove roles automatically as those purchases happen, with no manual step:
+
+- **On purchase** (`on_entitlement_create`) — the mapped role is granted within seconds.
+- **On refund or removal** (`on_entitlement_delete`) — the role is removed within seconds.
+- **On subscription cancellation** (`on_entitlement_update`) — Discord doesn't cut access off immediately; the member keeps it until their current billing period ends, so the role stays too until that happens.
+- **Every hour**, a reconciliation pass (`reconcile_sku_roles`) re-checks every mapped role against Discord's actual current entitlement list and corrects any drift — this is what guarantees a role gets removed once a subscription actually lapses, and it also catches purchases/cancellations that happened while the bot was offline (Discord doesn't replay missed events from downtime).
+
+Combine this with a banner tier on the same role (see above) and the whole chain becomes automatic: someone buys a SKU in Discord → they get the role within seconds → their next `/profile` shows the tier's banner look. No manual `/setbordercolor` or role-clicking needed anywhere in that chain.
+
+This is separate from the `/store`/Ko-fi setup below — that's for external storefronts where you (or a third-party integration) still have to grant the role yourself. If you're selling through Discord's native purchase flow instead, this is the fully-automated version of the same idea. A server can use either, both, or neither; they don't conflict since they both just end up granting a role.
+
+Requires `discord.py>=2.4.0` (already the pinned minimum in `requirements.txt`) and a bot application with Monetization enabled and at least one SKU created in the Developer Portal. `sku_id` is the numeric SKU ID from that page, not a product name.
+
 ## Store
 
 ```
@@ -345,7 +368,7 @@ Card rendering depends on the `Pillow` package (already in `requirements.txt`). 
 
 `/store` shows everyone a menu of whatever products you've configured, plus a **Visit Store** button linking wherever purchases actually happen — a Ko-fi page, a website, a Discord shop channel, wherever you're set up to take payments. The bot doesn't process payments itself; this is a catalog and a signpost, not a checkout.
 
-**This is the other half of the banner tier system** described above — `/store` is where members find out *what's for sale and where to buy it*, and the role they receive after buying (via your store's own role-granting integration, or manually) is what `/addbannertier` keys off of to show the right banner on their `/profile` card. Together they give you a working storefront today: list a product, tell buyers what role/tier it grants, and the visual payoff is automatic from there on. If you want to fully automate the middle step later too (a payment webhook that assigns the role itself, so no manual step is needed anywhere in the chain), that's a natural next step from here — just say the word when you're ready for it.
+**This is the other half of the banner tier system** described above — `/store` is where members find out *what's for sale and where to buy it*, and the role they receive after buying is what `/addbannertier` keys off of to show the right banner on their `/profile` card. If you're selling through an external storefront, that role still has to come from somewhere: your store's own Discord role-sync integration if it has one (e.g. Ko-fi's), or granted manually. If you're selling through Discord's own Monetization/SKU system instead, see "SKU role automation" above for the fully automatic version — no manual step at all.
 
 Products are stored per-server (up to 25, a Discord embed limit) with a name, price (any free-text format — `$5`, `500 Robux`, `Free`, whatever fits how you actually sell things), an optional description, and an optional emoji. Remove one with `/removeproduct` using its exact name, or via the settings panel's dropdown if you'd rather not worry about exact spelling.
 
