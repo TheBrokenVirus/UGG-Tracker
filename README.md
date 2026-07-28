@@ -62,6 +62,11 @@ weekly requirement (default: 20,000 XP/week).
 | Command | Who | Description |
 |---|---|---|
 | `/help` | Everyone | Browse every command by category via a dropdown — works in any channel even if you've restricted others to one. |
+| `/store` | Everyone | Shows the product menu and a "Visit Store" link button, if one's configured. Also works in any channel. See below. |
+| `/setstoreurl url:<link>` | Admin | Sets where the `/store` button goes — your Ko-fi, a website, wherever purchases actually happen. |
+| `/clearstoreurl` | Admin | Removes the store link. |
+| `/addproduct name: price: [description] [emoji]` | Admin | Adds a product to the `/store` menu (max 25). |
+| `/removeproduct name:<exact name>` | Admin | Removes a product by its exact name. |
 | `/settings` | Admin (Manage Server) | Opens an interactive panel with buttons and forms for everything below — no need to remember command syntax. See below. |
 | `/checkin xp:<number> [user]` | Everyone | Record current total XP. First checkin starts tracking. The `user` option lets an admin check in on someone else's behalf (e.g. if they can't use Discord themselves) — regular members can only check themselves in. |
 | `/status [user]` | Everyone | Show weekly progress, rate, and projection for yourself or another user. |
@@ -142,6 +147,11 @@ Running `/settings` opens an interactive panel (admins only) instead of typing o
 - **Inactivity Channel** — where inactivity reminder pings post (same as `/setinactivitychannel`)
 - **Admin Log Channel** — where destructive/data-altering admin actions get logged (same as `/setadminlogchannel`)
 - **Inactivity: Zero Checkins Only / +Behind Pace** — toggles whether inactivity pings also flag behind-pace members (same as `/toggleinactivitybehindpace`)
+
+**🛒 Store**
+- **Set Store URL** — a form for the link `/store`'s button opens (same as `/setstoreurl`)
+- **Add Product** — a form for name, price, description, and emoji (same as `/addproduct`)
+- **Remove Product** — pick a product from a dropdown to remove it (same as `/removeproduct`)
 
 **⚠️ Danger Zone**
 - **Remove All Users** — wipes every tracked user in the server; asks for confirmation first, same as `/removeallusers`
@@ -311,6 +321,19 @@ There's a curated 12-color palette (`/listbordercolors` shows all of them) — S
 **This is set up as the foundation for a future donation-perk system** — right now, `/setbordercolor` is admin-only, so *you* decide who gets which color (e.g. manually upgrading someone after they donate outside the bot). There's no automated payment or unlock system built yet; this just gives you the assignment mechanism and the visual payoff to build on top of later. If you want to add real donation handling down the line (a payment webhook automatically calling `/setbordercolor`, tracking who's "unlocked" which tier, letting donors pick their own color from what they've unlocked, etc.), that's a natural next step from here — just say the word when you're ready for it.
 
 Card rendering depends on the `Pillow` package (already in `requirements.txt`). If it's somehow missing, the command explains what to install rather than crashing. Font rendering automatically adapts to whatever's available on the host — it checks common Linux, Windows, and macOS font locations and falls back to a built-in font if none are found, so the card looks right on your Windows PC during testing and on whatever you eventually host it on.
+
+## Store
+
+```
+/setstoreurl url:https://ko-fi.com/yourpage
+/addproduct name:"Gold Border" price:$5 description:"Unlocks the Gold profile border" emoji:🏆
+```
+
+`/store` shows everyone a menu of whatever products you've configured, plus a **Visit Store** button linking wherever purchases actually happen — a Ko-fi page, a website, a Discord shop channel, wherever you're set up to take payments. The bot doesn't process payments itself; this is a catalog and a signpost, not a checkout.
+
+**This is the other half of the border-color donation system** mentioned above — `/store` is where members find out *what's for sale and where to buy it*, and `/setbordercolor` is where an admin actually grants the perk after a purchase happens (manually, for now). Together they give you a working storefront today, with the door left open for automating the middle step later — e.g. a payment webhook that calls `/setbordercolor` automatically instead of you doing it by hand each time. Say the word whenever you're ready to build that part.
+
+Products are stored per-server (up to 25, a Discord embed limit) with a name, price (any free-text format — `$5`, `500 Robux`, `Free`, whatever fits how you actually sell things), an optional description, and an optional emoji. Remove one with `/removeproduct` using its exact name, or via the settings panel's dropdown if you'd rather not worry about exact spelling.
 
 ## Public milestone announcements
 

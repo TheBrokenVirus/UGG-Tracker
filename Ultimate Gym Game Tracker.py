@@ -144,6 +144,8 @@ def default_guild_data() -> dict:
         "leaderboard_pagination": False,
         "admin_log_channel_id": None,
         "last_rank_snapshot_date": None,
+        "store_url": None,
+        "store_products": [],
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -167,6 +169,14 @@ def get_restricted_channel_id(guild_data: dict) -> Optional[int]:
 def get_admin_log_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
     return guild_data.get("admin_log_channel_id")
+
+def get_store_url(guild_data: dict) -> Optional[str]:
+    """Backward-compatible getter — older guild entries won't have this key."""
+    return guild_data.get("store_url")
+
+def get_store_products(guild_data: dict) -> list:
+    """Backward-compatible getter — older guild entries won't have this key."""
+    return guild_data.get("store_products", [])
 
 def inactivity_includes_behind_pace(guild_data: dict) -> bool:
     """Backward-compatible getter — older guild entries won't have this key."""
@@ -821,6 +831,11 @@ def build_settings_embed(guild_data: dict) -> discord.Embed:
     )
     admin_log_ch = get_admin_log_channel_id(guild_data)
     embed.add_field(name="Admin Action Log", value=f"<#{admin_log_ch}>" if admin_log_ch else "Off", inline=True)
+
+    store_url = get_store_url(guild_data)
+    product_count = len(get_store_products(guild_data))
+    store_val = f"{product_count} product(s)" + (" • link set" if store_url else " • no link yet")
+    embed.add_field(name="Store", value=store_val, inline=True)
 
     embed.set_footer(text="Use the buttons below to change settings. Panel expires after 5 minutes of inactivity.")
     return embed
@@ -2029,6 +2044,7 @@ SETTINGS_CATEGORIES = [
     ("display", "Display", "🎨", "Recent rate, compact leaderboard, pagination"),
     ("roles", "XP Roles", "🏅", "Milestone roles tied to XP thresholds"),
     ("automation", "Channels & Automation", "📢", "Tracking channel, announcements, schedules, pings"),
+    ("store", "Store", "🛒", "Store link and product menu for /store"),
     ("danger", "Danger Zone", "⚠️", "Bulk-remove tracked users"),
 ]
 
@@ -2164,6 +2180,118 @@ class RolesSettingsView(discord.ui.View):
         )
 
 
+class StoreURLModal(discord.ui.Modal, title="Set Store URL"):
+    url = discord.ui.TextInput(label="Store URL", placeholder="https://...", max_length=200)
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        url = self.url.value.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await interaction.response.send_message(
+                "That doesn't look like a valid URL — it needs to start with http:// or https://", ephemeral=True
+            )
+            return
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        guild_data["store_url"] = url
+        save_data(data)
+        await log_admin_action(interaction.guild, guild_data, interaction.user, "Set store URL", details=url)
+        await interaction.response.send_message(f"Store link set to {url}", ephemeral=True)
+
+
+class AddProductModal(discord.ui.Modal, title="Add Store Product"):
+    name = discord.ui.TextInput(label="Product name", placeholder="e.g. Gold Border", max_length=80)
+    price = discord.ui.TextInput(label="Price", placeholder="e.g. $5, 500 Robux, Free", max_length=40)
+    description = discord.ui.TextInput(
+        label="Description (optional)", style=discord.TextStyle.paragraph, required=False, max_length=200,
+    )
+    emoji = discord.ui.TextInput(label="Emoji (optional)", placeholder="🛒", required=False, max_length=10)
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        products = guild_data.setdefault("store_products", [])
+        if len(products) >= 25:
+            await interaction.response.send_message(
+                "The store is full (25 products max — a Discord embed limit). Remove one first.", ephemeral=True
+            )
+            return
+        name_val = self.name.value.strip()
+        price_val = self.price.value.strip()
+        products.append({
+            "name": name_val, "price": price_val,
+            "description": self.description.value.strip(), "emoji": self.emoji.value.strip() or "🛒",
+        })
+        save_data(data)
+        await log_admin_action(interaction.guild, guild_data, interaction.user, "Added store product", details=f"{name_val} ({price_val})")
+        await interaction.response.send_message(f"Added **{name_val}** ({price_val}) to the store.", ephemeral=True)
+
+
+class RemoveProductSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, products: list):
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(label=p["name"][:100], value=str(i), description=p.get("price", "")[:100])
+            for i, p in enumerate(products)
+        ]
+        super().__init__(placeholder="Choose a product to remove...", options=options[:25], min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        products = guild_data.get("store_products", [])
+        idx = int(self.values[0])
+        if 0 <= idx < len(products):
+            removed = products.pop(idx)
+            save_data(data)
+            await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed store product", details=removed["name"])
+            await interaction.response.send_message(f"Removed **{removed['name']}** from the store.", ephemeral=True)
+        else:
+            await interaction.response.send_message("That product no longer exists.", ephemeral=True)
+
+
+class RemoveProductView(discord.ui.View):
+    def __init__(self, guild_id: int, products: list):
+        super().__init__(timeout=120)
+        self.add_item(RemoveProductSelect(guild_id, products))
+
+
+class StoreSettingsView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await go_settings_home(interaction, self.guild_id)
+
+    @discord.ui.button(label="Set Store URL", style=discord.ButtonStyle.primary, emoji="🔗")
+    async def set_store_url(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(StoreURLModal(self.guild_id))
+
+    @discord.ui.button(label="Add Product", style=discord.ButtonStyle.primary, emoji="➕")
+    async def add_product(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddProductModal(self.guild_id))
+
+    @discord.ui.button(label="Remove Product", style=discord.ButtonStyle.secondary, emoji="➖")
+    async def remove_product(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        products = guild_data.get("store_products", [])
+        if not products:
+            await interaction.response.send_message("No products to remove yet.", ephemeral=True)
+            return
+        view = RemoveProductView(self.guild_id, products)
+        await interaction.response.send_message("Select a product to remove:", view=view, ephemeral=True)
+
+
 class AutomationSettingsView(discord.ui.View):
     def __init__(self, guild_id: int, inactivity_behind_pace: bool):
         super().__init__(timeout=300)
@@ -2278,6 +2406,8 @@ def build_settings_category_view(category: str, guild_id: int, guild_data: dict)
         return RolesSettingsView(guild_id)
     if category == "automation":
         return AutomationSettingsView(guild_id, inactivity_includes_behind_pace(guild_data))
+    if category == "store":
+        return StoreSettingsView(guild_id)
     if category == "danger":
         return DangerZoneSettingsView(guild_id)
     return SettingsHomeView(guild_id)
@@ -2526,6 +2656,36 @@ async def help_cmd(interaction: discord.Interaction):
     embed = build_help_overview_embed()
     view = HelpView()
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="store", description="View the server's store — products and a link to buy")
+async def store_cmd(interaction: discord.Interaction):
+    # Also deliberately unrestricted by channel, same reasoning as /help —
+    # commerce info should be visible from anywhere, not gated behind a
+    # tracking-only channel.
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    products = get_store_products(guild_data)
+    store_url = get_store_url(guild_data)
+
+    embed = discord.Embed(title=f"🛒 {interaction.guild.name} Store", color=discord.Color.gold())
+    if not products:
+        embed.description = "No products listed yet — check back soon!"
+    else:
+        for p in products:
+            emoji = p.get("emoji") or "🛒"
+            value = p.get("description") or "\u200b"  # zero-width space — embed fields can't be truly empty
+            embed.add_field(name=f"{emoji} {p['name']} — {p['price']}", value=value, inline=False)
+
+    view = None
+    if store_url:
+        embed.set_footer(text="Tap the button below to visit the store.")
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="Visit Store", style=discord.ButtonStyle.link, url=store_url, emoji="🛒"))
+    else:
+        embed.set_footer(text="Store link not set up yet — an admin can add one with /setstoreurl.")
+
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @bot.tree.command(name="checkin", description="Record current total Roblox XP — yours, or (admin) someone else's")
@@ -3172,6 +3332,83 @@ async def clearadminlogchannel(interaction: discord.Interaction):
     guild_data["admin_log_channel_id"] = None
     save_data(data)
     await interaction.response.send_message("Admin action logging is now off.")
+
+
+@bot.tree.command(name="setstoreurl", description="[Admin] Set the link shown by /store's Visit Store button")
+@app_commands.describe(url="Full URL to your store — must start with http:// or https://")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setstoreurl(interaction: discord.Interaction, url: str):
+    url = url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await interaction.response.send_message(
+            "That doesn't look like a valid URL — it needs to start with http:// or https://", ephemeral=True
+        )
+        return
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["store_url"] = url
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Set store URL", details=url)
+    await interaction.response.send_message(f"Store link set. `/store` will now show a button linking to {url}")
+
+
+@bot.tree.command(name="clearstoreurl", description="[Admin] Remove the store link")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clearstoreurl(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["store_url"] = None
+    save_data(data)
+    await interaction.response.send_message("Store link removed — `/store` will show the product menu without a button.")
+
+
+@bot.tree.command(name="addproduct", description="[Admin] Add a product to the /store menu")
+@app_commands.describe(
+    name="Product name",
+    price="Price, any format (e.g. $5, 500 Robux, Free)",
+    description="What this product gives — optional",
+    emoji="Emoji shown next to it — optional, defaults to 🛒",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def addproduct(
+    interaction: discord.Interaction, name: str, price: str,
+    description: str = "", emoji: str = "🛒",
+):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    products = guild_data.setdefault("store_products", [])
+    if len(products) >= 25:
+        await interaction.response.send_message(
+            "The store is full (25 products max — a Discord embed limit). Remove one first with `/removeproduct`.",
+            ephemeral=True,
+        )
+        return
+    products.append({
+        "name": name.strip(), "price": price.strip(),
+        "description": description.strip(), "emoji": emoji.strip() or "🛒",
+    })
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Added store product", details=f"{name.strip()} ({price.strip()})")
+    await interaction.response.send_message(f"Added **{name.strip()}** ({price.strip()}) to the store.")
+
+
+@bot.tree.command(name="removeproduct", description="[Admin] Remove a product from the /store menu")
+@app_commands.describe(name="Exact product name to remove — check /store for exact spelling")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def removeproduct(interaction: discord.Interaction, name: str):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    products = guild_data.get("store_products", [])
+    match = next((p for p in products if p["name"].lower() == name.strip().lower()), None)
+    if not match:
+        await interaction.response.send_message(
+            "No product with that exact name found — check `/store` for exact spelling.", ephemeral=True
+        )
+        return
+    products.remove(match)
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed store product", details=match["name"])
+    await interaction.response.send_message(f"Removed **{match['name']}** from the store.")
 
 
 @bot.tree.command(name="setinactivitythreshold", description="[Admin] Set how long before week-end inactivity pings fire")
@@ -4138,6 +4375,10 @@ setinactivitychannel.error(_perm_error)
 clearinactivitychannel.error(_perm_error)
 setadminlogchannel.error(_perm_error)
 clearadminlogchannel.error(_perm_error)
+setstoreurl.error(_perm_error)
+clearstoreurl.error(_perm_error)
+addproduct.error(_perm_error)
+removeproduct.error(_perm_error)
 setinactivitythreshold.error(_perm_error)
 toggleinactivitybehindpace.error(_perm_error)
 toggleleaderboardpagination.error(_perm_error)
