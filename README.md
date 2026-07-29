@@ -61,6 +61,8 @@ weekly requirement (default: 20,000 XP/week).
 
 **"Owner" below means restricted to the bot's Discord application owner specifically** (or its team, if the application is team-owned) — not "Manage Server" in whichever server the command is run in. This covers store/SKU commands since they're tied to *your* actual storefront and Discord Monetization SKUs, not something that makes sense for each server's own admins to reconfigure. Everything else uses normal per-server "Admin" permissions, so if you invite this bot to other servers, their own admins can manage their own tracking/roles/display settings without being able to touch your store setup. See "Packaging the bot for other servers" near the end of this document for more on this.
 
+**⭐ marks a Premium command** — it still uses normal per-server "Admin" permissions, but additionally requires that specific server to have Premium access (a paid guild subscription, or a free exemption you've granted — see "Premium features" below). A non-Premium server's admins see these commands like any other, they just get told the server needs Premium when they try to use one.
+
 | Command | Who | Description |
 |---|---|---|
 | `/help` | Everyone | Browse every command by category via a dropdown — works in any channel even if you've restricted others to one. |
@@ -87,35 +89,39 @@ weekly requirement (default: 20,000 XP/week).
 | `/syncxproles` | Admin | Re-checks every tracked member's roles right now — fixes leftover role clutter without waiting for everyone's next checkin. |
 | `/progresschart [user]` | Everyone | Shows a line chart of XP over time, built from that person's checkin history. Needs at least 2 checkins. |
 | `/profile [user]` | Everyone | Shows a rendered profile card: avatar, colored border, Crew XP, rank, this week's gain, and a progress bar. See below. |
-| `/setbordercolor user: color: [custom_hex]` | Admin | Assign a profile border color — a preset from the palette, or an exact hex code. This is the *unpaid/default* look; see "Banner tiers" below for the store-linked version. |
-| `/removebordercolor user:<@user>` | Admin | Reset a user's border color to the default. |
-| `/listbordercolors` | Everyone | Show all available preset border colors. |
+| `/setbordercolor user: color: [custom_hex]` | Admin ⭐ | Assign a profile border color — a preset from the palette, or an exact hex code. This is the *unpaid/default* look; see "Banner tiers" below for the store-linked version. |
+| `/removebordercolor user:<@user>` | Admin ⭐ | Reset a user's border color to the default. |
+| `/listbordercolors` | Everyone ⭐ | Show all available preset border colors. |
 | `/toggleanimatedprofile enabled:<true/false>` | Admin | Turn the animated rainbow-tier `/profile` card on or off server-wide (static image instead of a GIF). See below. |
-| `/addbannertier role: name: mode: color1: [color2] priority:` | Admin | Ties a profile banner look to a role — e.g. a role your store/Ko-fi integration grants on purchase. See "Banner tiers" below. |
-| `/removebannertier role:<@role>` | Admin | Removes a role's banner tier. |
-| `/listbannertiers` | Everyone | Shows all configured banner tiers, their roles, and their colors. |
+| `/addbannertier role: name: mode: color1: [color2] priority:` | Admin ⭐ | Ties a profile banner look to a role — e.g. a role your store/Ko-fi integration grants on purchase. See "Banner tiers" below. |
+| `/removebannertier role:<@role>` | Admin ⭐ | Removes a role's banner tier. |
+| `/listbannertiers` | Everyone ⭐ | Shows all configured banner tiers, their roles, and their colors. |
 | `/addskurole sku_id: role: name:` | Owner | Auto-grants a role while a member has an active Discord purchase/subscription for a SKU, and removes it when that ends. See "SKU role automation" below. |
 | `/removeskurole sku_id:<id>` | Owner | Stops auto-granting a role for a SKU. |
 | `/listskuroles` | Admin | Shows all configured SKU → role mappings. |
-| `/exportdata [file_format]` | Admin | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
-| `/backup` | Admin | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
-| `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
+| `/setpremiumsku sku_id:` | Owner | Sets the guild-subscription SKU that grants Premium. See "Premium features" below. |
+| `/addpremiumguild [guild_id]` | Owner | Grants a server free Premium — no subscription needed. Defaults to the current server if left blank. |
+| `/removepremiumguild [guild_id]` | Owner | Removes a server's free Premium exemption. Defaults to the current server if left blank. |
+| `/listpremiumguilds` | Owner | Shows every server with Premium, split into free (exempt) and paid (subscribed). |
+| `/exportdata [file_format]` | Admin ⭐ | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
+| `/backup` | Admin ⭐ | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
+| `/restore file:<.json>` | Admin ⭐ | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
 | `/setadminlogchannel channel:<#channel>` | Admin | Log destructive/data-altering admin actions to a channel. See below. |
 | `/clearadminlogchannel` | Admin | Turn off admin action logging. |
 | `/setchannel channel:<#channel>` | Admin | Restrict `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` to one channel. Admin/config commands still work anywhere. |
 | `/clearchannel` | Admin | Remove the channel restriction. |
-| `/setannouncechannel channel:<#channel>` | Admin | Post a public congratulations message whenever someone earns an XP milestone role. |
-| `/clearannouncechannel` | Admin | Turn off milestone announcements. |
+| `/setannouncechannel channel:<#channel>` | Admin ⭐ | Post a public congratulations message whenever someone earns an XP milestone role. |
+| `/clearannouncechannel` | Admin ⭐ | Turn off milestone announcements. |
 | `/setweeklypost channel:<#channel>` | Admin | Auto-post the weekly leaderboard shortly before each week ends. Requires a shared server week. |
 | `/clearweeklypost` | Admin | Turn off the auto-posted weekly leaderboard. |
-| `/setinactivitychannel channel:<#channel>` | Admin | Ping anyone with zero checkins as the week nears its end. Requires a shared server week. |
-| `/clearinactivitychannel` | Admin | Turn off inactivity reminder pings. |
-| `/setinactivitythreshold days: hours: minutes:` | Admin | How long before week-end the inactivity ping fires (default: 24 hours). |
-| `/toggleinactivitybehindpace enabled:<true/false>` | Admin | Whether inactivity pings also include people who checked in but are behind pace, not just people with zero checkins (default: off — zero checkins only). |
+| `/setinactivitychannel channel:<#channel>` | Admin ⭐ | Ping anyone with zero checkins as the week nears its end. Requires a shared server week. |
+| `/clearinactivitychannel` | Admin ⭐ | Turn off inactivity reminder pings. |
+| `/setinactivitythreshold days: hours: minutes:` | Admin ⭐ | How long before week-end the inactivity ping fires (default: 24 hours). |
+| `/toggleinactivitybehindpace enabled:<true/false>` | Admin ⭐ | Whether inactivity pings also include people who checked in but are behind pace, not just people with zero checkins (default: off — zero checkins only). |
 | `/toggleleaderboardpagination enabled:<true/false>` | Admin | Switch leaderboards between Previous/Next paging and the default single truncated embed. |
 | `/setbaseline user:<@user> starting_xp:<number>` | Admin | Set or correct someone's all-time starting XP — this is what `/totalleaderboard` calculates total gain from. |
-| `/importxp file:<.csv or .xlsx> [existing_users] [announce_milestones]` | Admin | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. `announce_milestones` (default: no) controls whether XP role milestones hit during this import get posted publicly. See below. |
-| `/undoimport` | Admin | Reverts **everyone's** data back to exactly how it looked right before the last `/importxp` ran — the only way to undo a whole batch at once, since `/undo` only handles one person's most recent checkin at a time. Only reverts the single most recent import. |
+| `/importxp file:<.csv or .xlsx> [existing_users] [announce_milestones]` | Admin ⭐ | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. `announce_milestones` (default: no) controls whether XP role milestones hit during this import get posted publicly. See below. |
+| `/undoimport` | Admin ⭐ | Reverts **everyone's** data back to exactly how it looked right before the last `/importxp` ran — the only way to undo a whole batch at once, since `/undo` only handles one person's most recent checkin at a time. Only reverts the single most recent import. |
 | `/fullreset user:<@user> [clear_history]` | Admin | Reset **both** weekly and all-time totals at once, starting fresh from their current XP. `clear_history: true` (default) also wipes their stored checkin history. Unlike `/removeuser`, they stay registered — no need to re-checkin to restart tracking. |
 | `/resetweek user:<@user>` | Admin | Manually restart someone's weekly window right now (0 days elapsed). |
 | `/setweekprogress user:<@user> [days] [hours] [minutes] [week_start_xp]` | Admin | Manually set how far into the week someone is, in plain days/hours/minutes (e.g. `days: 3, hours: 12` treats them as if their week started 3.5 days ago). Optionally also override their starting XP for the week. |
@@ -368,6 +374,29 @@ Combine this with a banner tier on the same role (see above) and the whole chain
 This is separate from the `/store`/Ko-fi setup below — that's for external storefronts where you (or a third-party integration) still have to grant the role yourself. If you're selling through Discord's native purchase flow instead, this is the fully-automated version of the same idea. A server can use either, both, or neither; they don't conflict since they both just end up granting a role.
 
 Requires `discord.py>=2.4.0` (already the pinned minimum in `requirements.txt`) and a bot application with Monetization enabled and at least one SKU created in the Developer Portal. `sku_id` is the numeric SKU ID from that page, not a product name.
+
+## Premium features
+
+```
+/setpremiumsku sku_id:1122334455667788990
+/addpremiumguild
+```
+
+A separate tier from the per-user SKU roles above: this one is a **guild subscription** — a whole server gets unlocked, not one member. `/setpremiumsku` tells the bot which SKU ID (from the Developer Portal) represents that subscription. Once set, a server counts as Premium if it either has an active subscription for that SKU, or is on the free-exemption list.
+
+**The ⭐-marked commands in the table above are Premium-gated:** mass data management (`/importxp`, `/exportdata`, `/undoimport`), inactivity pings (`/setinactivitychannel` and friends), data safety (`/backup`, `/restore`), milestone announcements (`/setannouncechannel`, `/clearannouncechannel`), and customizable profiles (`/addbannertier`, `/removebannertier`, `/listbannertiers`, `/setbordercolor`, `/removebordercolor`, `/listbordercolors`). A non-Premium server's admins can still see and try these commands — they're told the server needs Premium, same tone as a normal permission error, not hidden entirely.
+
+This isn't just a command-time check. If a server's subscription lapses, three things that were already running stop on their own rather than quietly continuing forever: inactivity pings stop firing, milestone announcements stop posting, and `/profile` cards revert to the default look (banner tiers and custom border colors both fall back) — all re-checked live, not just when they were originally configured. The alternative — checking only at setup time — would let a server subscribe once, configure everything, cancel, and keep every perk permanently.
+
+**Free exceptions, e.g. your own server:**
+
+```
+/addpremiumguild
+```
+
+Run with no arguments in a server to exempt that server specifically — this is the common case, including your own. Pass a `guild_id` to exempt a different server without being in it. `/removepremiumguild` undoes it, and `/listpremiumguilds` shows everything currently exempt or subscribed, by name where the bot can resolve it.
+
+Like the SKU role automation, this is kept in sync by two layers: `on_entitlement_create`/`on_entitlement_delete`/`on_entitlement_update` react within seconds, and `reconcile_premium_guilds` re-derives the truth from Discord's actual entitlement list once an hour as a safety net (catches anything the gateway events alone can't fully cover — see "SKU role automation" above for why that safety net matters). All four premium commands (`/setpremiumsku`, `/addpremiumguild`, `/removepremiumguild`, `/listpremiumguilds`) are Owner-only, same restriction as the store commands — this is a business decision about who gets access, not a per-server setting.
 
 ## Store
 

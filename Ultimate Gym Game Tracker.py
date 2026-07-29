@@ -165,6 +165,62 @@ def normalize_guild_data(guild_data: dict) -> dict:
     merged.update(guild_data)
     return merged
 
+# ---------------------------------------------------------------------------
+# Premium (guild subscription) — see PremiumFeatures below for what's gated
+# ---------------------------------------------------------------------------
+# Deliberately stored at the top level of `data`, not inside a specific
+# guild's own settings — premium status isn't something a server configures
+# for itself, it's the bot owner's business decision about who gets access.
+# A guild counts as premium if it's on the exempt list (comped access,
+# e.g. your own server — see /addpremiumguild) OR has a currently active
+# Discord guild-subscription entitlement for the configured premium SKU
+# (kept in sync by the entitlement events and reconcile_premium_guilds
+# task, same pattern as the SKU role automation above).
+
+def get_premium_sku_id(data: dict) -> Optional[str]:
+    """Backward-compatible getter — the SKU ID (from the Developer
+    Portal's Monetization page) representing the guild subscription that
+    grants premium. None until set with /setpremiumsku."""
+    return data.get("premium_sku_id")
+
+def get_premium_exempt_guilds(data: dict) -> list:
+    """Backward-compatible getter — list of guild ID strings that count
+    as premium for free, regardless of subscription status. Managed with
+    /addpremiumguild and /removepremiumguild."""
+    return data.get("premium_exempt_guilds", [])
+
+def get_premium_active_guilds(data: dict) -> list:
+    """Backward-compatible getter — list of guild ID strings with a
+    currently active real subscription entitlement, maintained
+    automatically by the entitlement gateway events and
+    reconcile_premium_guilds. Not meant to be hand-edited — use
+    /addpremiumguild for comped access instead."""
+    return data.get("premium_active_guilds", [])
+
+def is_guild_premium(data: dict, guild_id: int) -> bool:
+    """The single source of truth for whether a guild currently has
+    premium access — exempt (comped) OR an active paid subscription.
+    Every premium-gated command and feature checks this, never the two
+    lists directly, so the exemption and subscription paths always agree."""
+    gid = str(guild_id)
+    return gid in get_premium_exempt_guilds(data) or gid in get_premium_active_guilds(data)
+
+def require_premium():
+    """Command decorator restricting a command to guilds with premium
+    access (exempt or subscribed — see is_guild_premium). Distinct from
+    is_bot_owner(): this is about which SERVER gets the feature, not
+    which USER is running the command — any admin in a premium server can
+    use these, same as any other admin command."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        data = load_data()
+        if is_guild_premium(data, interaction.guild_id):
+            return True
+        raise app_commands.CheckFailure(
+            "This is a **Premium** feature — this server doesn't currently have an active subscription. "
+            "Contact the bot owner if you believe this is a mistake."
+        )
+    return app_commands.check(predicate)
+
 def get_restricted_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
     return guild_data.get("restricted_channel_id")
@@ -314,9 +370,14 @@ async def apply_xp_roles(
 
 async def announce_role_milestone(guild: discord.Guild, guild_data: dict, member: discord.Member, roles: list):
     """Posts a public congratulations message when someone earns a new
-    milestone role, if a channel has been configured via /setannouncechannel."""
+    milestone role, if a channel has been configured via
+    /setannouncechannel — a premium feature (see /setpremiumsku), so this
+    also re-checks premium status at send time rather than only when the
+    channel was configured, in case the subscription has since lapsed."""
     channel_id = get_announce_channel_id(guild_data)
     if not channel_id:
+        return
+    if not is_guild_premium(load_data(), guild.id):
         return
     channel = guild.get_channel(channel_id)
     if not channel:
@@ -2277,6 +2338,12 @@ HELP_CATEGORIES = [
         ("/removeskurole sku_id:<id>", "Stop auto-granting a role for a SKU"),
         ("/listskuroles", "Show all configured SKU → role mappings"),
     ]),
+    ("owner_premium", "Owner: Premium", "⭐", "Which servers get premium features, and why", [
+        ("/setpremiumsku sku_id:", "Set the guild-subscription SKU that grants premium"),
+        ("/addpremiumguild [guild_id]", "Grant a server free premium — defaults to the current server"),
+        ("/removepremiumguild [guild_id]", "Remove a server's free premium exemption"),
+        ("/listpremiumguilds", "Show every server with premium, free or paid"),
+    ]),
     ("admin_display", "Admin: Display", "🎨", "How leaderboards and status look", [
         ("/togglerecentrate enabled:", "Show/hide the \"Recent Rate\" field"),
         ("/togglecompactleaderboard enabled:", "Short vs. full-detail leaderboard entries"),
@@ -3068,11 +3135,42 @@ async def _apply_sku_entitlement(entitlement: discord.Entitlement, grant: bool):
         save_data(data)
 
 
+async def _apply_guild_premium_entitlement(entitlement: discord.Entitlement, grant: bool):
+    """Grants (or revokes) premium status for the guild this entitlement
+    is for — only acts if the entitlement's SKU matches the one set via
+    /setpremiumsku, and only for guild-scoped entitlements (a member
+    subscribing to unlock premium for their whole server), since that's
+    what a "guild subscription" SKU produces. Updates
+    data["premium_active_guilds"], which is_guild_premium checks
+    alongside the exempt list."""
+    data = load_data()
+    premium_sku_id = get_premium_sku_id(data)
+    if not premium_sku_id or str(entitlement.sku_id) != str(premium_sku_id):
+        return
+    if entitlement.guild_id is None:
+        return
+    gid = str(entitlement.guild_id)
+    active = data.setdefault("premium_active_guilds", [])
+    if grant and gid not in active:
+        active.append(gid)
+        save_data(data)
+        guild = bot.get_guild(entitlement.guild_id)
+        if guild:
+            await log_admin_action(guild, get_guild(data, entitlement.guild_id), bot.user, "Premium activated (subscription)")
+    elif not grant and gid in active:
+        active.remove(gid)
+        save_data(data)
+        guild = bot.get_guild(entitlement.guild_id)
+        if guild:
+            await log_admin_action(guild, get_guild(data, entitlement.guild_id), bot.user, "Premium deactivated (subscription ended)")
+
+
 @bot.event
 async def on_entitlement_create(entitlement: discord.Entitlement):
     """Fired when someone purchases a SKU (one-time) or starts a
     subscription — grants the mapped role right away."""
     await _apply_sku_entitlement(entitlement, grant=True)
+    await _apply_guild_premium_entitlement(entitlement, grant=True)
 
 
 @bot.event
@@ -3083,6 +3181,7 @@ async def on_entitlement_delete(entitlement: discord.Entitlement):
     its billing period after cancellation; reconcile_sku_roles catches
     that case within the hour instead."""
     await _apply_sku_entitlement(entitlement, grant=False)
+    await _apply_guild_premium_entitlement(entitlement, grant=False)
 
 
 @bot.event
@@ -3096,6 +3195,7 @@ async def on_entitlement_update(entitlement: discord.Entitlement):
     remove it once Discord actually excludes the entitlement as ended."""
     if entitlement.ends_at is not None and entitlement.ends_at <= utcnow():
         await _apply_sku_entitlement(entitlement, grant=False)
+        await _apply_guild_premium_entitlement(entitlement, grant=False)
 
 
 @tasks.loop(hours=1)
@@ -3156,6 +3256,37 @@ async def reconcile_sku_roles():
 
 @reconcile_sku_roles.before_loop
 async def before_reconcile_sku_roles():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(hours=1)
+async def reconcile_premium_guilds():
+    """Same safety net as reconcile_sku_roles, for guild premium status
+    instead of member roles: re-derives which guilds currently have an
+    active premium-SKU entitlement straight from Discord and corrects
+    data["premium_active_guilds"] to match — catches subscriptions
+    started or lapsed while the bot was offline, and lapses that
+    happened after a cancellation's grace period ended without a clean
+    on_entitlement_delete. Guilds on the exempt list are untouched here;
+    this only manages the "paid" half of is_guild_premium."""
+    data = load_data()
+    premium_sku_id = get_premium_sku_id(data)
+    if not premium_sku_id:
+        return
+    try:
+        active = [e async for e in bot.entitlements(exclude_ended=True, limit=None) if str(e.sku_id) == str(premium_sku_id)]
+    except discord.HTTPException:
+        return
+    active_guild_ids = sorted({str(e.guild_id) for e in active if e.guild_id is not None})
+
+    data = load_data()  # reload — time has passed since the fetch above, avoid clobbering concurrent writes
+    if data.get("premium_active_guilds", []) != active_guild_ids:
+        data["premium_active_guilds"] = active_guild_ids
+        save_data(data)
+
+
+@reconcile_premium_guilds.before_loop
+async def before_reconcile_premium_guilds():
     await bot.wait_until_ready()
 
 
@@ -3231,9 +3362,9 @@ async def scheduled_checks():
             guild_data["last_weekly_post_marker"] = week_marker
             changed = True
 
-        # --- Inactivity ping ---
+        # --- Inactivity ping (premium feature — see /setpremiumsku) ---
         inactivity_channel_id = get_inactivity_channel_id(guild_data)
-        if inactivity_channel_id:
+        if inactivity_channel_id and is_guild_premium(data, guild.id):
             threshold = timedelta(hours=get_inactivity_threshold_hours(guild_data))
             include_behind_pace = inactivity_includes_behind_pace(guild_data)
             if (
@@ -3340,6 +3471,8 @@ async def on_ready():
         rotate_presence.start()
     if not reconcile_sku_roles.is_running():
         reconcile_sku_roles.start()
+    if not reconcile_premium_guilds.is_running():
+        reconcile_premium_guilds.start()
 
 
 # ---------------------------------------------------------------------------
@@ -3721,19 +3854,27 @@ async def _render_member_profile(guild: discord.Guild, guild_data: dict, member:
     Returns (BytesIO, filename, banner) — banner is handed back too so
     the caller can decide whether a customize panel makes sense (only
     when the member holds no tier, since a tier's look is fixed by
-    design, not something to pick from a dropdown)."""
+    design, not something to pick from a dropdown).
+
+    Banner tiers and custom border colors are a premium feature (see
+    /setpremiumsku) — re-checked here at render time, not just when
+    /addbannertier or /setbordercolor were originally run, so a lapsed
+    subscription reverts everyone to the default look instead of the
+    customization quietly staying in effect forever."""
     entry = guild_data["users"][str(member.id)]
     ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
     rank = next((i + 1 for i, (uid, _) in enumerate(ranked) if uid == str(member.id)), len(ranked))
     total_members = len(ranked)
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
 
+    is_premium = is_guild_premium(load_data(), guild.id)
     rank_change = get_rank_change(entry, rank)
     animation_allowed = get_animated_profiles_enabled(guild_data)
-    banner = get_member_banner_tier(guild_data, member)
+    banner = get_member_banner_tier(guild_data, member) if is_premium else None
+    render_entry = entry if is_premium else {**entry, "border_color": DEFAULT_BORDER_COLOR}
 
     card_buf = await build_profile_card(
-        member, entry, stats, guild_data["requirement"], rank, total_members,
+        member, render_entry, stats, guild_data["requirement"], rank, total_members,
         rank_change=rank_change, banner=banner, animation_allowed=animation_allowed,
     )
     will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
@@ -3953,6 +4094,7 @@ async def clearchannel(interaction: discord.Interaction):
 @bot.tree.command(name="setannouncechannel", description="[Admin] Post a public message when someone earns an XP milestone role")
 @app_commands.describe(channel="Channel where milestone announcements will be posted")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def setannouncechannel(interaction: discord.Interaction, channel: discord.TextChannel):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -3967,6 +4109,7 @@ async def setannouncechannel(interaction: discord.Interaction, channel: discord.
 
 @bot.tree.command(name="clearannouncechannel", description="[Admin] Turn off public milestone role announcements")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def clearannouncechannel(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4009,6 +4152,7 @@ async def clearweeklypost(interaction: discord.Interaction):
 @bot.tree.command(name="setinactivitychannel", description="[Admin] Ping people who haven't checked in as the week nears its end")
 @app_commands.describe(channel="Channel where inactivity reminders will be posted")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def setinactivitychannel(interaction: discord.Interaction, channel: discord.TextChannel):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4030,6 +4174,7 @@ async def setinactivitychannel(interaction: discord.Interaction, channel: discor
 
 @bot.tree.command(name="clearinactivitychannel", description="[Admin] Turn off inactivity reminder pings")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def clearinactivitychannel(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4145,6 +4290,7 @@ async def removeproduct(interaction: discord.Interaction, name: str):
     minutes="Plus minutes (0-59)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def setinactivitythreshold(interaction: discord.Interaction, days: int = 0, hours: int = 0, minutes: int = 0):
     try:
         delta = parse_dhm_fields(str(days), str(hours), str(minutes))
@@ -4171,6 +4317,7 @@ async def setinactivitythreshold(interaction: discord.Interaction, days: int = 0
 )
 @app_commands.describe(enabled="True to also include behind-pace members, false for zero-checkins only (default)")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def toggleinactivitybehindpace(interaction: discord.Interaction, enabled: bool):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4235,6 +4382,7 @@ async def resetweek(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(name="backup", description="[Admin] Download a full backup of ALL settings and tracked data for this server")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def backup_cmd(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4266,6 +4414,7 @@ async def backup_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="restore", description="[Admin] Restore ALL settings and tracked data from a /backup file — replaces everything")
 @app_commands.describe(file="The .json file downloaded from /backup")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def restore_cmd(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(thinking=True, ephemeral=True)
 
@@ -4315,6 +4464,7 @@ async def restore_cmd(interaction: discord.Interaction, file: discord.Attachment
     app_commands.Choice(name="Excel (.xlsx)", value="xlsx"),
 ])
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def exportdata(interaction: discord.Interaction, file_format: app_commands.Choice[str] = None):
     fmt = file_format.value if file_format else "csv"
     await interaction.response.defer(thinking=True)
@@ -4407,6 +4557,7 @@ async def exportdata(interaction: discord.Interaction, file_format: app_commands
     app_commands.Choice(name="Reset — wipe and restart, like /fullreset", value="reset"),
 ])
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def importxp(
     interaction: discord.Interaction,
     file: discord.Attachment,
@@ -4555,6 +4706,7 @@ async def importxp(
 
 @bot.tree.command(name="undoimport", description="[Admin] Revert everyone's data back to how it looked before the last /importxp")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def undoimport(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4740,6 +4892,7 @@ async def syncxproles(interaction: discord.Interaction):
     for name, hex_val in PRESET_BORDER_COLORS.items()
 ])
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def setbordercolor(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -4782,6 +4935,7 @@ async def setbordercolor(
 @bot.tree.command(name="removebordercolor", description="[Admin] Reset a user's profile border color to the default")
 @app_commands.describe(user="User to reset")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def removebordercolor(interaction: discord.Interaction, user: discord.Member):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4797,6 +4951,7 @@ async def removebordercolor(interaction: discord.Interaction, user: discord.Memb
 
 
 @bot.tree.command(name="listbordercolors", description="Show all available profile border colors")
+@require_premium()
 async def listbordercolors(interaction: discord.Interaction):
     lines = [f"**{name}** — `{hex_val}`" for name, hex_val in PRESET_BORDER_COLORS.items()]
     embed = discord.Embed(
@@ -4821,6 +4976,7 @@ async def listbordercolors(interaction: discord.Interaction):
     priority="Higher number = more premium. If a member holds roles for multiple tiers, the highest priority wins.",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def addbannertier(
     interaction: discord.Interaction,
     role: discord.Role,
@@ -4876,6 +5032,7 @@ async def addbannertier(
 @bot.tree.command(name="removebannertier", description="[Admin] Remove a role's banner tier")
 @app_commands.describe(role="The role whose banner tier should be removed")
 @app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
 async def removebannertier(interaction: discord.Interaction, role: discord.Role):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4896,6 +5053,7 @@ async def removebannertier(interaction: discord.Interaction, role: discord.Role)
 
 
 @bot.tree.command(name="listbannertiers", description="Show all configured profile banner tiers")
+@require_premium()
 async def listbannertiers(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -5005,6 +5163,94 @@ async def listskuroles(interaction: discord.Interaction):
     )
     embed.set_footer(text="Roles are granted/removed automatically as entitlements start and end.")
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="setpremiumsku", description="[Owner] Set the SKU ID for the guild premium subscription")
+@app_commands.describe(sku_id="The guild-subscription SKU's ID from the Developer Portal's Monetization page")
+@is_bot_owner()
+async def setpremiumsku(interaction: discord.Interaction, sku_id: str):
+    cleaned_sku = sku_id.strip()
+    if not cleaned_sku.isdigit():
+        await interaction.response.send_message(
+            "That doesn't look like a valid SKU ID — it should be a numeric ID from the Developer Portal's "
+            "Monetization page.", ephemeral=True,
+        )
+        return
+    data = load_data()
+    data["premium_sku_id"] = cleaned_sku
+    save_data(data)
+    await interaction.response.send_message(
+        f"Premium SKU set to `{cleaned_sku}`. Guilds with an active subscription for it now count as premium — "
+        f"this is checked automatically within an hour by reconciliation even for existing subscriptions, or "
+        f"instantly for new ones going forward.", ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="addpremiumguild",
+    description="[Owner] Grant a server free premium access, no subscription needed (e.g. your own server)",
+)
+@app_commands.describe(guild_id="Server ID to exempt — defaults to the server you run this in if left blank")
+@is_bot_owner()
+async def addpremiumguild(interaction: discord.Interaction, guild_id: Optional[str] = None):
+    target_id = guild_id.strip() if guild_id else str(interaction.guild_id)
+    if not target_id.isdigit():
+        await interaction.response.send_message("That doesn't look like a valid server ID.", ephemeral=True)
+        return
+    data = load_data()
+    exempt = data.setdefault("premium_exempt_guilds", [])
+    if target_id in exempt:
+        await interaction.response.send_message(f"Server `{target_id}` already has free premium access.", ephemeral=True)
+        return
+    exempt.append(target_id)
+    save_data(data)
+    target_guild = bot.get_guild(int(target_id))
+    name_note = f" ({target_guild.name})" if target_guild else ""
+    await interaction.response.send_message(
+        f"Server `{target_id}`{name_note} now has premium access, free — no subscription needed.", ephemeral=True,
+    )
+
+
+@bot.tree.command(name="removepremiumguild", description="[Owner] Remove a server's free premium exemption")
+@app_commands.describe(guild_id="Server ID to remove — defaults to the server you run this in if left blank")
+@is_bot_owner()
+async def removepremiumguild(interaction: discord.Interaction, guild_id: Optional[str] = None):
+    target_id = guild_id.strip() if guild_id else str(interaction.guild_id)
+    data = load_data()
+    exempt = data.setdefault("premium_exempt_guilds", [])
+    if target_id not in exempt:
+        await interaction.response.send_message(f"Server `{target_id}` isn't on the free-access list.", ephemeral=True)
+        return
+    exempt.remove(target_id)
+    save_data(data)
+    note = " It may still have premium if it has an active paid subscription." if target_id in get_premium_active_guilds(data) else ""
+    await interaction.response.send_message(f"Removed server `{target_id}`'s free premium access.{note}", ephemeral=True)
+
+
+@bot.tree.command(name="listpremiumguilds", description="[Owner] Show which servers have premium and why")
+@is_bot_owner()
+async def listpremiumguilds(interaction: discord.Interaction):
+    data = load_data()
+    exempt = get_premium_exempt_guilds(data)
+    active = get_premium_active_guilds(data)
+
+    def _describe(gid: str) -> str:
+        guild = bot.get_guild(int(gid))
+        return f"`{gid}` — {guild.name}" if guild else f"`{gid}` — (not currently in this server)"
+
+    lines = []
+    if exempt:
+        lines.append("**Free access (exempt):**\n" + "\n".join(_describe(g) for g in exempt))
+    if active:
+        lines.append("**Paid subscription (active):**\n" + "\n".join(_describe(g) for g in active))
+    if not lines:
+        lines.append("No servers currently have premium — configure a SKU with `/setpremiumsku`, or "
+                      "add a free exception with `/addpremiumguild`.")
+
+    embed = discord.Embed(title="⭐ Premium Servers", description="\n\n".join(lines), color=discord.Color.gold())
+    sku_id = get_premium_sku_id(data)
+    embed.set_footer(text=f"Premium SKU: {sku_id}" if sku_id else "No premium SKU configured yet.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -5289,28 +5535,42 @@ async def _channel_error(interaction: discord.Interaction, error: app_commands.A
     else:
         raise error
 
+# Shared error handler for commands gated by BOTH Manage Server and
+# @require_premium() — MissingPermissions gets the same friendly message
+# as _perm_error, and require_premium()'s CheckFailure carries its own
+# message already (same as _channel_error's generic handling).
+async def _perm_or_premium_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message(
+            "You need the **Manage Server** permission to use this command.", ephemeral=True
+        )
+    elif isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message(str(error), ephemeral=True)
+    else:
+        raise error
+
 setrequirement.error(_perm_error)
 setchannel.error(_perm_error)
 clearchannel.error(_perm_error)
-setannouncechannel.error(_perm_error)
-clearannouncechannel.error(_perm_error)
+setannouncechannel.error(_perm_or_premium_error)
+clearannouncechannel.error(_perm_or_premium_error)
 setweeklypost.error(_perm_error)
 clearweeklypost.error(_perm_error)
-setinactivitychannel.error(_perm_error)
-clearinactivitychannel.error(_perm_error)
+setinactivitychannel.error(_perm_or_premium_error)
+clearinactivitychannel.error(_perm_or_premium_error)
 setadminlogchannel.error(_perm_error)
 clearadminlogchannel.error(_perm_error)
 setstoreurl.error(_channel_error)
 clearstoreurl.error(_channel_error)
 addproduct.error(_channel_error)
 removeproduct.error(_channel_error)
-setinactivitythreshold.error(_perm_error)
-toggleinactivitybehindpace.error(_perm_error)
+setinactivitythreshold.error(_perm_or_premium_error)
+toggleinactivitybehindpace.error(_perm_or_premium_error)
 toggleleaderboardpagination.error(_perm_error)
-exportdata.error(_perm_error)
-undoimport.error(_perm_error)
-backup_cmd.error(_perm_error)
-restore_cmd.error(_perm_error)
+exportdata.error(_perm_or_premium_error)
+undoimport.error(_perm_or_premium_error)
+backup_cmd.error(_perm_or_premium_error)
+restore_cmd.error(_perm_or_premium_error)
 togglerecentrate.error(_perm_error)
 toggleanimatedprofile.error(_perm_error)
 togglecompactleaderboard.error(_perm_error)
@@ -5318,16 +5578,22 @@ setproratethreshold.error(_perm_error)
 addxprole.error(_perm_error)
 removexprole.error(_perm_error)
 syncxproles.error(_perm_error)
-importxp.error(_perm_error)
+importxp.error(_perm_or_premium_error)
 settings_cmd.error(_perm_error)
 setbaseline.error(_perm_error)
-setbordercolor.error(_perm_error)
-removebordercolor.error(_perm_error)
-addbannertier.error(_perm_error)
-removebannertier.error(_perm_error)
+setbordercolor.error(_perm_or_premium_error)
+removebordercolor.error(_perm_or_premium_error)
+addbannertier.error(_perm_or_premium_error)
+removebannertier.error(_perm_or_premium_error)
+listbannertiers.error(_channel_error)
+listbordercolors.error(_channel_error)
 addskurole.error(_channel_error)
 removeskurole.error(_channel_error)
 listskuroles.error(_perm_error)
+setpremiumsku.error(_channel_error)
+addpremiumguild.error(_channel_error)
+removepremiumguild.error(_channel_error)
+listpremiumguilds.error(_channel_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
 setweekprogress.error(_perm_error)
