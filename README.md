@@ -79,6 +79,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/crewtotals` | Everyone | The whole crew's combined XP added together — total XP and this week's gain, summed across everyone tracked (including anyone no longer in the server). |
 | `/crewlevel` | Everyone | The crew's in-game level (an exponential formula, see below), progress to the next one, and an ETA based on the crew's combined recent pace. |
 | `/setcrewlevelformula base_xp: growth_rate:` | Admin | Sets the level-1→2 XP cost and the per-level growth rate `/crewlevel` uses. See "Crew level" below. |
+| `/adjustcrewxp amount:` | Admin | Manually adds (or subtracts, with a negative number) from the crew's combined XP total used by `/crewtotals` and `/crewlevel`. See "Crew level" below. |
 | `/history [user]` | Everyone | Last 10 checkins for a user. |
 | `/undo [user]` | Everyone (own checkins); Admin for others | Remove the most recent checkin and revert current XP to the one before it. If it was someone's only checkin, tracking resets entirely. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
@@ -312,9 +313,18 @@ Roblox gym crews often have an in-game "crew level" that levels up as the crew's
 
 **Calibrating it to match the real in-game numbers:** the defaults (1,000 / 1.15) are a starting guess, not a known-correct value — Roblox doesn't publish the actual formula. Run `/crewlevel`, compare the level it reports against your crew's real level in-game, and adjust `base_xp`/`growth_rate` with `/setcrewlevelformula` until they match. Two known real data points (e.g. "we were level 8 at X combined XP, hit level 9 at Y") pin down both numbers precisely — the same calibration approach the spreadsheet's "Calibration Check" cell is built around.
 
-**What "combined XP" means here:** the same definition as `/crewtotals`' "Total XP (crew)" — every tracked member's current XP added together, including members no longer in the server. Not `/totalxpgained`-style "since they started tracking" — this is the crew's actual current total, since that's what the real in-game level is presumably based on.
+**What "combined XP" means here:** the same definition as `/crewtotals`' "Total XP (crew)" — every tracked member's current XP added together, including members no longer in the server, **and members explicitly removed from tracking** (`/removeuser`, `/removeuserbyid`, `/removeallusers`, `/removestaleusers`) — their final XP is banked into a permanent running total before their entry is deleted, so the crew's level can never go *down* just because someone stopped being individually tracked. That matches reality: the crew's actual in-game total doesn't shrink when the bot stops watching one member. Not `/totalxpgained`-style "since they started tracking" — this is the crew's actual current total, since that's what the real in-game level is presumably based on.
 
 **The ETA is a real projection, not a guess:** it sums each member's own current-week `rate_per_day` (the same rate `/status` shows individually) into one combined crew-wide daily rate, then divides the remaining XP to the next level by that rate. A member with a currently negative rate (e.g. right after an admin correction) is floored to 0 for this calculation rather than dragging the whole crew's estimate down — one person's data cleanup shouldn't make the ETA worse. If the crew's combined rate is 0 (no one's gained anything recently), it says so plainly instead of showing an infinite or nonsensical ETA.
+
+**Next Milestone field** — alongside the immediate next level, `/crewlevel` also shows XP remaining and an ETA for the next *round* level: 10, 20, 30, ... 100, 110, and so on. If the crew's already sitting exactly on a multiple of 10, this correctly targets the *next* one rather than the level they're already at.
+
+```
+/adjustcrewxp amount:50000
+/adjustcrewxp amount:-10000
+```
+
+For manually correcting the crew's combined XP total — reconciling against a real in-game number, or backfilling contributions from removals that happened before `bank_removed_user` existed (nothing can automatically recover XP from a removal that predates this feature; this is the manual fix for that). Positive adds, negative subtracts, and it's a running total — each use adds to whatever adjustment is already on file rather than replacing it, so undoing a specific adjustment is just running the same command with the sign flipped. Shows up in both `/crewtotals` and `/crewlevel`, and in the admin log if one's configured.
 
 ## Analytics
 
@@ -345,6 +355,8 @@ Posts a log entry to that channel whenever an admin runs a data-affecting comman
 Routine display toggles (`/togglerecentrate`, `/togglecompactleaderboard`, etc.) are deliberately **not** logged, to keep the log meaningful rather than noisy — it's focused on things that change tracked data or affect the whole server, not cosmetic preferences.
 
 Turn it off with `/clearadminlogchannel`.
+
+**This same channel also flags multi-week catch-up checkins** — a fairness gap worth understanding: the week-rollover logic only runs when a member actually checks in, and it has no way to know when *within* a gap their XP changed. If someone goes 7+ days without checking in and then checks in once, the entire gain since their last checkin gets counted toward whichever week they finally show up in — a two-week grind compressed into one week's numbers, effectively giving them a head start the following week. Rather than guessing how to split that gain across the weeks it might have actually happened in (which the bot fundamentally can't know), a checkin after a 7+ day gap with real XP gained posts an "⚠️ Catch-Up Checkin Flagged" note to the admin log channel — who, how long the gap was, how much XP was counted — so an admin can look at the specific case and decide for themselves, e.g. adjusting with `/setweekprogress`, rather than the bot silently either allowing it or rewriting someone's numbers on their behalf. Nothing is changed automatically; this is purely informational. A checkin that comes back to zero real gain (someone just confirming they're still at the same XP) doesn't trigger it — only an actual multi-week gap with real progress attached does.
 
 ## Progress charts
 

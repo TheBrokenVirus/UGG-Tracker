@@ -173,6 +173,9 @@ def default_guild_data() -> dict:
         "sku_roles": {},
         "crew_level_base_xp": 1000,
         "crew_level_growth_rate": 1.15,
+        "banked_removed_xp": 0,
+        "banked_removed_gained": 0,
+        "crew_xp_adjustment": 0,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -457,6 +460,40 @@ async def log_admin_action(
         pass
 
 
+async def log_catchup_checkin(guild: discord.Guild, guild_data: dict, member: discord.Member, gap: timedelta, gained: int):
+    """Flags a checkin that follows 7+ days of silence from that member —
+    called from /checkin, not automatically part of record_checkin/
+    ensure_current_week. The week-rollover logic has no way to know when
+    within a multi-week gap XP was actually earned, so the entire gain
+    since their last checkin ends up counted toward whichever week they
+    finally check back into — potentially a multi-week grind showing up
+    as one huge single week. Rather than silently attributing it or
+    guessing how to split it, this surfaces it to the admin log channel
+    (same one as /setadminlogchannel — no separate setup) so admins can
+    look at the specific case and decide for themselves, e.g. with
+    /setweekprogress, whether anything needs adjusting. Deliberately
+    changes no numbers on its own. Never raises — same as log_admin_action."""
+    channel_id = get_admin_log_channel_id(guild_data)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    embed = discord.Embed(
+        title="⚠️ Catch-Up Checkin Flagged",
+        description=(
+            f"{member.mention} just checked in after **{format_timedelta(gap)}** with no checkin before that. "
+            f"The full **+{gained:,} XP** gained over that gap is being counted toward the current week, "
+            f"since there's no way to know when within that time it was actually earned."
+        ),
+        color=discord.Color.orange(), timestamp=utcnow(),
+    )
+    embed.set_footer(text="Informational only — nothing was changed automatically. Adjust with /setweekprogress if needed.")
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
 def join_leaderboard_lines(lines: list, limit: int = 3900) -> str:
     """Joins leaderboard lines, staying under Discord's 4096-char embed
     description limit. If it would overflow, truncates and notes how many
@@ -580,6 +617,39 @@ def get_baseline(entry: dict) -> tuple:
     entry["baseline_xp"] = first_checkin["xp"]
     entry["baseline_time"] = first_checkin["time"]
     return entry["baseline_xp"], entry["baseline_time"]
+
+def bank_removed_user(guild_data: dict, entry: dict) -> None:
+    """Preserves a member's contribution to crew-wide totals (/crewtotals,
+    /crewlevel) even after their individual tracking entry is deleted —
+    call this BEFORE deleting an entry in any removal command
+    (/removeuser, /removeuserbyid, /removeallusers, /removestaleusers).
+    Without this, a member's real historical XP would vanish from
+    crew-wide sums the instant they're removed from individual tracking,
+    which doesn't match reality: the crew's actual total in-game XP
+    doesn't go down just because the bot stops tracking someone by name.
+    Banks both raw current_xp (for /crewtotals' "Total XP" and
+    /crewlevel) and all-time gained (for /crewtotals' "All-Time Gained"),
+    since those are two different numbers that both need preserving."""
+    guild_data["banked_removed_xp"] = guild_data.get("banked_removed_xp", 0) + entry["current_xp"]
+    baseline_xp, _ = get_baseline(entry)
+    guild_data["banked_removed_gained"] = guild_data.get("banked_removed_gained", 0) + (entry["current_xp"] - baseline_xp)
+
+def get_banked_removed_xp(guild_data: dict) -> int:
+    """Backward-compatible getter — see bank_removed_user."""
+    return guild_data.get("banked_removed_xp", 0)
+
+def get_banked_removed_gained(guild_data: dict) -> int:
+    """Backward-compatible getter — see bank_removed_user."""
+    return guild_data.get("banked_removed_gained", 0)
+
+def get_crew_xp_adjustment(guild_data: dict) -> int:
+    """Backward-compatible getter — a manual admin correction to the
+    crew's combined XP total (/crewtotals, /crewlevel), separate from
+    bank_removed_user's automatic removed-user preservation. Set with
+    /adjustcrewxp — e.g. to reconcile against the real in-game total, or
+    to backfill XP from removals that happened before that feature
+    existed (see bank_removed_user's docstring)."""
+    return guild_data.get("crew_xp_adjustment", 0)
 
 def get_personal_bests(entry: dict) -> dict:
     """Backward-compatible getter — entries created before this feature
@@ -2189,12 +2259,15 @@ class ConfirmRemoveAllView(discord.ui.View):
         data = load_data()
         guild_data = get_guild(data, self.guild_id)
         removed = len(guild_data["users"])
+        for entry in guild_data["users"].values():
+            bank_removed_user(guild_data, entry)
         guild_data["users"] = {}
         save_data(data)
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ Removed tracking data for **{removed}** user(s). Everyone starts fresh with their next `/checkin`.",
+            content=f"✅ Removed tracking data for **{removed}** user(s). Everyone starts fresh with their next "
+                    f"`/checkin` — their prior XP still counts toward `/crewtotals` and `/crewlevel`.",
             view=self,
         )
         await log_admin_action(
@@ -2244,13 +2317,15 @@ class ConfirmRemoveStaleView(discord.ui.View):
         removed = 0
         for uid in self.stale_uids:
             if uid in guild_data["users"]:
+                bank_removed_user(guild_data, guild_data["users"][uid])
                 del guild_data["users"][uid]
                 removed += 1
         save_data(data)
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ Removed tracking data for **{removed}** member(s) no longer in the server.",
+            content=f"✅ Removed tracking data for **{removed}** member(s) no longer in the server — their prior "
+                    f"XP still counts toward `/crewtotals` and `/crewlevel`.",
             view=self,
         )
         await log_admin_action(
@@ -2584,6 +2659,7 @@ HELP_CATEGORIES = [
     ]),
     ("admin_crewlevel", "Admin: Crew Level", "🏰", "The exponential formula behind /crewlevel", [
         ("/setcrewlevelformula base_xp: growth_rate:", "Set the level-1→2 XP and per-level growth rate"),
+        ("/adjustcrewxp amount:", "Manually add/subtract from the crew's combined XP total"),
     ]),
     ("admin_users", "Admin: Users & Data", "👤", "Correcting, resetting, importing, exporting", [
         ("/setbaseline user: starting_xp:", "Set/correct someone's all-time starting XP"),
@@ -3942,6 +4018,12 @@ async def checkin(interaction: discord.Interaction, xp: int, user: Optional[disc
             rate_str = " (too soon for a reliable rate)"
         extra = ("Since Last Checkin", f"+{gained:,} XP over {duration_str}{rate_str}")
 
+        # A gap of 7+ days means at least one full week boundary was
+        # crossed with no checkin in between — see log_catchup_checkin
+        # for why that's worth flagging rather than silently counting.
+        if elapsed >= timedelta(days=7) and gained > 0:
+            await log_catchup_checkin(interaction.guild, guild_data, target, elapsed, gained)
+
     embed = build_status_embed(
         target, entry, stats, guild_data["requirement"],
         extra_field=extra, show_recent_rate=show_recent_rate_enabled(guild_data),
@@ -4103,14 +4185,21 @@ async def totalleaderboard(interaction: discord.Interaction):
 async def crewtotals(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
+    banked_xp = get_banked_removed_xp(guild_data)
+    banked_gained = get_banked_removed_gained(guild_data)
+    adjustment = get_crew_xp_adjustment(guild_data)
 
-    if not guild_data["users"]:
+    if not guild_data["users"] and not banked_xp and not adjustment:
         await interaction.response.send_message("No one is being tracked yet. Use `/checkin` to get started.")
         return
 
-    total_current_xp = 0
+    # Seeded with banked totals from removed users (see bank_removed_user)
+    # and any manual /adjustcrewxp correction, so someone being
+    # individually un-tracked — or a one-off admin correction — doesn't
+    # make the crew's combined totals go backwards unexpectedly.
+    total_current_xp = banked_xp + adjustment
     total_gained_week = 0
-    total_alltime_gained = 0
+    total_alltime_gained = banked_gained + adjustment
     on_track_count = 0
     member_count = len(guild_data["users"])
 
@@ -4133,7 +4222,12 @@ async def crewtotals(interaction: discord.Interaction):
     embed.add_field(name="Tracked Members", value=str(member_count), inline=True)
     embed.add_field(name="On Track This Week", value=f"{on_track_count}/{member_count}", inline=True)
     embed.add_field(name="Avg XP/Member This Week", value=f"{avg_weekly:,.0f}", inline=True)
-    embed.set_footer(text="Includes members no longer in the server — their tracked XP still counts toward crew totals.")
+    footer = "Includes members no longer in the server — their tracked XP still counts toward crew totals."
+    if banked_xp:
+        footer += f" Also includes {banked_xp:,} XP from members removed from individual tracking (/removeuser etc.)."
+    if adjustment:
+        footer += f" Includes a manual adjustment of {adjustment:+,} XP (see /adjustcrewxp)."
+    embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed)
 
 
@@ -4142,13 +4236,19 @@ async def crewtotals(interaction: discord.Interaction):
 async def crewlevel_cmd(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
+    banked_xp = get_banked_removed_xp(guild_data)
+    adjustment = get_crew_xp_adjustment(guild_data)
 
-    if not guild_data["users"]:
+    if not guild_data["users"] and not banked_xp and not adjustment:
         await interaction.response.send_message("No one is being tracked yet. Use `/checkin` to get started.")
         return
 
     base, growth = get_crew_level_formula(guild_data)
-    total_xp = 0
+    # Seeded with banked XP from removed users (see bank_removed_user) and
+    # any manual /adjustcrewxp correction — someone being un-tracked
+    # individually, or a one-off admin correction, shouldn't make the
+    # crew's level go backwards, same reasoning as /crewtotals.
+    total_xp = banked_xp + adjustment
     combined_rate_per_day = 0.0
     for uid, entry in guild_data["users"].items():
         stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
@@ -4199,11 +4299,57 @@ async def crewlevel_cmd(interaction: discord.Interaction):
                 inline=False,
             )
 
-    embed.set_footer(
-        text=f"Formula: {base:,.0f} XP for level 1→2, {(growth - 1) * 100:.0f}% more each level after. "
-             f"Calibrate with /setcrewlevelformula if this doesn't match the real in-game level."
-    )
+    # Next round "base 10" milestone (10, 20, ..., 100, 110, ...) — not
+    # capped at CREW_LEVEL_MAX, since cumulative_xp_for_level is a pure
+    # formula with no table lookup involved, unlike compute_crew_level's
+    # search loop above.
+    next_milestone_level = ((result["level"] // 10) + 1) * 10
+    milestone_threshold = cumulative_xp_for_level(next_milestone_level, base, growth)
+    milestone_xp_remaining = max(milestone_threshold - total_xp, 0)
+    if combined_rate_per_day > 0:
+        milestone_days_left = milestone_xp_remaining / combined_rate_per_day
+        milestone_eta = utcnow() + timedelta(days=milestone_days_left)
+        milestone_value = (
+            f"{milestone_xp_remaining:,.0f} XP remaining\n"
+            f"~{format_timedelta(timedelta(days=milestone_days_left))}, around <t:{int(milestone_eta.timestamp())}:D>"
+        )
+    else:
+        milestone_value = f"{milestone_xp_remaining:,.0f} XP remaining\nNot enough recent activity to estimate a pace yet."
+    embed.add_field(name=f"Next Milestone: Level {next_milestone_level}", value=milestone_value, inline=False)
+
+    footer = f"Formula: {base:,.0f} XP for level 1→2, {(growth - 1) * 100:.0f}% more each level after."
+    if adjustment:
+        footer += f" Includes a manual adjustment of {adjustment:+,} XP (see /adjustcrewxp)."
+    footer += " Calibrate the formula with /setcrewlevelformula if levels don't match the real in-game ones."
+    embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="adjustcrewxp", description="[Admin] Manually add or subtract from the crew's combined XP total")
+@app_commands.describe(amount="Amount to add to the crew's total XP — use a negative number to subtract")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def adjustcrewxp(interaction: discord.Interaction, amount: int):
+    if amount == 0:
+        await interaction.response.send_message("That wouldn't change anything — give a non-zero amount.", ephemeral=True)
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["crew_xp_adjustment"] = guild_data.get("crew_xp_adjustment", 0) + amount
+    save_data(data)
+
+    running_total = guild_data["crew_xp_adjustment"]
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Adjusted crew XP total",
+        details=f"{amount:+,} XP (running manual adjustment now {running_total:+,})",
+    )
+    await interaction.response.send_message(
+        f"{'Added' if amount > 0 else 'Subtracted'} **{abs(amount):,} XP** {'to' if amount > 0 else 'from'} the "
+        f"crew's combined total — running manual adjustment is now **{running_total:+,} XP**. "
+        f"Affects `/crewtotals` and `/crewlevel`. Run `/adjustcrewxp amount:{-amount}` to undo just this change."
+    )
+
+
 
 
 @bot.tree.command(name="setcrewlevelformula", description="[Admin] Set the exponential formula /crewlevel uses to calculate crew level")
@@ -6087,10 +6233,14 @@ async def removeuser(interaction: discord.Interaction, user: discord.Member):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
     if str(user.id) in guild_data["users"]:
+        bank_removed_user(guild_data, guild_data["users"][str(user.id)])
         del guild_data["users"][str(user.id)]
         save_data(data)
         await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed user", target=user.mention)
-        await interaction.response.send_message(f"Removed tracking data for {user.display_name}.")
+        await interaction.response.send_message(
+            f"Removed tracking data for {user.display_name}. Their XP still counts toward `/crewtotals` and "
+            f"`/crewlevel` — only their individual tracking entry was removed."
+        )
     else:
         await interaction.response.send_message("No data found for that user.", ephemeral=True)
 
@@ -6111,12 +6261,16 @@ async def removeuserbyid(interaction: discord.Interaction, discord_id: str):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
     if uid in guild_data["users"]:
+        bank_removed_user(guild_data, guild_data["users"][uid])
         del guild_data["users"][uid]
         save_data(data)
         member = interaction.guild.get_member(int(uid))
         name = member.display_name if member else f"user {uid} (no longer in this server)"
         await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed user by ID", target=name)
-        await interaction.response.send_message(f"Removed tracking data for {name}.")
+        await interaction.response.send_message(
+            f"Removed tracking data for {name}. Their XP still counts toward `/crewtotals` and "
+            f"`/crewlevel` — only their individual tracking entry was removed."
+        )
     else:
         await interaction.response.send_message("No tracking data found for that ID.", ephemeral=True)
 
@@ -6190,6 +6344,7 @@ setannouncechannel.error(_perm_or_premium_error)
 clearannouncechannel.error(_perm_or_premium_error)
 setweeklypost.error(_perm_error)
 setcrewlevelformula.error(_perm_error)
+adjustcrewxp.error(_perm_error)
 clearweeklypost.error(_perm_error)
 setinactivitychannel.error(_perm_or_premium_error)
 clearinactivitychannel.error(_perm_or_premium_error)
