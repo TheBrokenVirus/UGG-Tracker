@@ -107,6 +107,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/addpremiumguild [guild_id]` | Owner | Grants a server free Premium — no subscription needed. Defaults to the current server if left blank. |
 | `/removepremiumguild [guild_id]` | Owner | Removes a server's free Premium exemption. Defaults to the current server if left blank. |
 | `/listpremiumguilds` | Owner | Shows every server with Premium, split into free (exempt) and paid (subscribed). |
+| `/listservers` | Owner | Lists every server the bot is currently in — member count, tracked members, Premium status, when it joined, and its ID. Discord doesn't expose this anywhere in the Developer Portal, so this is the only way to see it. |
 | `/exportdata [file_format]` | Admin ⭐ | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin ⭐ | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
 | `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. Not Premium-gated — see "Backup & restore" below for why. |

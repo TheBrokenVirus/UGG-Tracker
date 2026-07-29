@@ -2697,6 +2697,7 @@ HELP_CATEGORIES = [
         ("/addpremiumguild [guild_id]", "Grant a server free premium — defaults to the current server"),
         ("/removepremiumguild [guild_id]", "Remove a server's free premium exemption"),
         ("/listpremiumguilds", "Show every server with premium, free or paid"),
+        ("/listservers", "List every server this bot is currently in"),
     ]),
     ("admin_display", "Admin: Display", "🎨", "How leaderboards and status look", [
         ("/togglerecentrate enabled:", "Show/hide the \"Recent Rate\" field"),
@@ -6077,6 +6078,41 @@ async def listpremiumguilds(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="listservers", description="[Owner] List every server this bot is currently in")
+@is_bot_owner()
+async def listservers(interaction: discord.Interaction):
+    guilds = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
+
+    if not guilds:
+        await interaction.response.send_message("This bot isn't in any servers right now.", ephemeral=True)
+        return
+
+    data = load_data()
+    lines = []
+    for g in guilds:
+        guild_data = data.get("guilds", {}).get(str(g.id), {})
+        tracked = len(guild_data.get("users", {}))
+        premium = "⭐" if is_guild_premium(data, g.id) else ""
+        joined = f"<t:{int(g.me.joined_at.timestamp())}:D>" if g.me and g.me.joined_at else "unknown"
+        lines.append(f"**{g.name}** {premium} — {g.member_count or '?'} members, {tracked} tracked — joined {joined} — `{g.id}`")
+
+    out, used, cut = [], 0, 0
+    for i, line in enumerate(lines):
+        needed = len(line) + 1
+        if used + needed > 3900:
+            cut = len(lines) - i
+            break
+        out.append(line)
+        used += needed
+    description = "\n".join(out)
+    if cut:
+        description += f"\n…and {cut} more (list too long for one embed)"
+
+    embed = discord.Embed(title=f"🌐 Servers ({len(guilds)})", description=description, color=discord.Color.blurple())
+    embed.set_footer(text="⭐ = has Premium access. \"Tracked\" = members with /checkin data in that server.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(
     name="setbaseline",
     description="[Admin] Set or correct a user's all-time starting XP (used for the total leaderboard)",
@@ -6430,6 +6466,7 @@ setpremiumsku.error(_channel_error)
 addpremiumguild.error(_channel_error)
 removepremiumguild.error(_channel_error)
 listpremiumguilds.error(_channel_error)
+listservers.error(_channel_error)
 previewtier.error(_channel_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
