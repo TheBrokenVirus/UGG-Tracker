@@ -107,6 +107,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/exportdata [file_format]` | Admin ⭐ | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin ⭐ | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
 | `/restore file:<.json>` | Admin ⭐ | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
+| `/analytics` | Admin ⭐ | Server-wide activity: retention week-over-week, most active day, top gainer, average gain. See below. |
 | `/setadminlogchannel channel:<#channel>` | Admin | Log destructive/data-altering admin actions to a channel. See below. |
 | `/clearadminlogchannel` | Admin | Turn off admin action logging. |
 | `/setchannel channel:<#channel>` | Admin | Restrict `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` to one channel. Admin/config commands still work anywhere. |
@@ -294,6 +295,22 @@ Uploads that file back and **completely replaces** the server's current settings
 
 A backup taken with an older version of the bot (missing settings that didn't exist yet) restores fine — any keys not present in the file get filled in with current defaults rather than causing an error.
 
+## Analytics
+
+```
+/analytics
+```
+
+A Premium-gated snapshot of how the server's actually doing, not just individual stats:
+
+- **Tracked Members** and **Active This Week** — how many people have checked in at all vs. in the last 7 days.
+- **Retention vs Last Week** — what fraction of last week's active members are still checking in this week. This is the number worth watching over time; a server can have a healthy member count while quietly losing engagement, and total-member-count alone won't show that.
+- **Avg Gain (Active Members)** — the average of `gained_this_week` across only people who've actually checked in, so a pile of inactive members doesn't drag the number down and hide what's really happening with the people still showing up.
+- **Most Active Day** — the day of the week with the most checkins across everyone's history, useful for timing announcements or scheduled posts around when people are actually active.
+- **Top Gainer This Week** — same leader `/weeklyleaderboard` would show, surfaced here too since it's relevant context alongside the rest.
+
+Retention and most-active-day are both derived from stored checkin history, which is capped per user (`MAX_CHECKINS_STORED`, 50 by default) to keep the data file from growing forever — for a very long-tracked, very active member, their oldest checkins may have aged out, which can slightly skew those two numbers for that person specifically. Doesn't affect Tracked Members, Active This Week, or Avg Gain, which are based on current totals rather than history.
+
 ## Admin action log
 
 With this many destructive commands now available (`/fullreset`, `/removeallusers`, `/undoimport`, `/restore`, and more), it's worth having a record of who did what, especially once more than one person has admin access.
@@ -331,6 +348,8 @@ Rank #1 gets a gold star and gold-accented rank text regardless of banner tier, 
 **If a member holds a banner tier, its name appears as a small colored badge in the top-right corner** (e.g. "SUPPORTER", "ELITE") — pulled straight from the `name` you gave it in `/addbannertier`, colored with the tier's own primary color, with the badge's text automatically flipped between near-black and near-white depending on which reads better against that particular color.
 
 The rank-1 star and the rank-change up/down indicators are drawn as actual shapes, not Unicode symbol characters (★/▲/▼) — Windows' Arial, a common fallback font, doesn't reliably include those glyph blocks, which could make them silently fail to render (or show as a blank box) depending on what font the host has available. Drawing them as vector shapes instead means they always render correctly regardless of platform or installed fonts.
+
+**Personal bests** — if a member has ever set a new single-day or single-week XP record, a small "Best Day X · Best Week Y" line shows up on their card between their rank and their stats. Both are tracked automatically, not something anyone has to set: best-day is the most XP gained between one checkin and the next on a given calendar day (UTC), best-week is the highest weekly total a completed week has ever closed with. A brand-new member with no records yet simply doesn't get the line at all, rather than showing "Best Day 0."
 
 **Daily rank change** — next to the rank, the card shows how much someone's rank has moved since the last daily snapshot: ▲2 in green for climbing, ▼1 in red for dropping, or — for no change. A background task takes one snapshot per UTC day for every server with tracked users (no shared week required for this specific feature, unlike the scheduled post and inactivity pings). The indicator only appears once at least one snapshot has happened — a server's very first day using the bot won't show a rank-change badge yet, since there's nothing to compare against.
 

@@ -547,6 +547,10 @@ def create_user(guild_data: dict, user_id: int, xp: int) -> dict:
         "week_start_time": iso(week_start),
         "week_start_xp": xp,
         "checkins": [{"time": iso(now), "xp": xp}],
+        "best_day_xp": 0,
+        "best_day_date": None,
+        "best_week_xp": 0,
+        "best_week_date": None,
     }
     guild_data["users"][str(user_id)] = entry
     return entry
@@ -563,6 +567,21 @@ def get_baseline(entry: dict) -> tuple:
     entry["baseline_xp"] = first_checkin["xp"]
     entry["baseline_time"] = first_checkin["time"]
     return entry["baseline_xp"], entry["baseline_time"]
+
+def get_personal_bests(entry: dict) -> dict:
+    """Backward-compatible getter — entries created before this feature
+    won't have these keys. Returns the highest single-day and single-week
+    XP gains ever recorded for this member, with the date each happened.
+    Both are maintained incrementally (see record_checkin and
+    ensure_current_week) rather than recomputed from checkin history,
+    since checkin history is capped (MAX_CHECKINS_STORED) and would
+    silently lose old records once they aged out otherwise."""
+    return {
+        "best_day_xp": entry.get("best_day_xp", 0),
+        "best_day_date": entry.get("best_day_date"),
+        "best_week_xp": entry.get("best_week_xp", 0),
+        "best_week_date": entry.get("best_week_date"),
+    }
 
 # ---------------------------------------------------------------------------
 # Spreadsheet import
@@ -692,11 +711,23 @@ def ensure_current_week(entry: dict) -> bool:
     """Roll the tracking window forward if 7+ days have elapsed since
     week_start_time. Uses the most recent known XP as the new week's
     starting point (an approximation, since we only know XP at checkin
-    times, not at the exact week boundary)."""
+    times, not at the exact week boundary).
+
+    Also checks the completed week's total gain against best_week_xp
+    before resetting, updating the record if it's a new high. Only
+    covers weeks that end via this natural rollover — a week ended early
+    by an admin override (/setweekprogressall, /resetweek, etc.) isn't
+    checked for a new record, since those are edge cases rather than the
+    normal weekly flow and touching every one of those call sites for a
+    personal-best check wasn't worth the added complexity."""
     now = utcnow()
     week_start = parse_iso(entry["week_start_time"])
     rolled = False
     while now - week_start >= timedelta(days=7):
+        week_gain = entry["current_xp"] - entry["week_start_xp"]
+        if week_gain > entry.get("best_week_xp", 0):
+            entry["best_week_xp"] = week_gain
+            entry["best_week_date"] = entry["week_start_time"]
         week_start = week_start + timedelta(days=7)
         entry["week_start_time"] = iso(week_start)
         entry["week_start_xp"] = entry["current_xp"]
@@ -704,10 +735,32 @@ def ensure_current_week(entry: dict) -> bool:
     return rolled
 
 def record_checkin(entry: dict, xp: int) -> Optional[dict]:
-    """Records a new checkin, returns the previous checkin (or None)."""
+    """Records a new checkin, returns the previous checkin (or None).
+
+    Also tracks the highest single-day XP gain ever recorded
+    (best_day_xp). A "day" here means the calendar-UTC-date of the
+    checkin that closed it — the entire gain since the previous checkin
+    is attributed to today, same approximation the rest of the bot
+    already makes for week boundaries (we only know XP at checkin times,
+    not continuously). The running total for today is checked against
+    the record immediately, not just when the day rolls over, so a new
+    best shows up live rather than only being confirmed the next day."""
     ensure_current_week(entry)
     now = utcnow()
     last = entry["checkins"][-1] if entry["checkins"] else None
+
+    if last is not None:
+        gain = xp - last["xp"]
+        if gain > 0:
+            today = now.date().isoformat()
+            if entry.get("_day_bucket_date") != today:
+                entry["_day_bucket_date"] = today
+                entry["_day_bucket_gain"] = 0
+            entry["_day_bucket_gain"] = entry.get("_day_bucket_gain", 0) + gain
+            if entry["_day_bucket_gain"] > entry.get("best_day_xp", 0):
+                entry["best_day_xp"] = entry["_day_bucket_gain"]
+                entry["best_day_date"] = today
+
     entry["current_xp"] = xp
     entry["checkins"].append({"time": iso(now), "xp": xp})
     if len(entry["checkins"]) > MAX_CHECKINS_STORED:
@@ -1170,6 +1223,7 @@ STATIC_PROFILE_SCALE = 5
 async def build_profile_card(
     member: discord.abc.User, entry: dict, stats: dict, requirement: int, rank: int, total_members: int,
     rank_change: Optional[int] = None, banner: Optional[dict] = None, animation_allowed: bool = True,
+    personal_bests: Optional[dict] = None,
 ) -> Optional[io.BytesIO]:
     """Renders a profile card: avatar with a colored ring, name, rank
     (with a daily rank-change indicator), Crew XP, this week's gain, and a
@@ -1178,6 +1232,11 @@ async def build_profile_card(
 
     rank_change, if given, is
     current-vs-yesterday's-snapshot rank movement (positive = moved up).
+
+    personal_bests, if given (see get_personal_bests), shows a small
+    "🏆 Best Day X · Best Week Y" line between the rank and the stats —
+    only rendered when there's at least one non-zero record, so a
+    brand-new member's card doesn't show a row of zeroes.
 
     The look of the border/background comes from `banner`, the member's
     resolved banner tier (see get_member_banner_tier) — a dict with
@@ -1355,6 +1414,15 @@ async def build_profile_card(
                         [badge_x, badge_cy - 3 * SCALE, badge_x + 18 * SCALE, badge_cy + 3 * SCALE],
                         radius=3 * SCALE, fill=MUTED_TEXT,
                     )
+
+            if personal_bests and (personal_bests.get("best_day_xp") or personal_bests.get("best_week_xp")):
+                pb_font = _find_profile_font(False, 19 * SCALE)
+                parts = []
+                if personal_bests.get("best_day_xp"):
+                    parts.append(f"Best Day {personal_bests['best_day_xp']:,}")
+                if personal_bests.get("best_week_xp"):
+                    parts.append(f"Best Week {personal_bests['best_week_xp']:,}")
+                draw.text((text_x, 178 * SCALE), "   •   ".join(parts), font=pb_font, fill=MUTED_TEXT)
 
             stat_y = 205 * SCALE
             draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
@@ -2401,6 +2469,11 @@ HELP_CATEGORIES = [
         ("/importxp file: [existing_users] [announce_milestones]", "Bulk-set XP from a CSV/Excel file"),
         ("/exportdata [file_format]", "Download everyone's stats as CSV/Excel"),
         ("/undoimport", "Revert the entire last import in one action"),
+        ("/backup", "Download a full backup of every setting and every user"),
+        ("/restore file:<.json>", "Restore a full backup (confirmation required)"),
+    ]),
+    ("admin_analytics", "Admin: Analytics", "📊", "Server-wide activity, retention, and trends", [
+        ("/analytics", "Tracked members, retention, most active day, top gainer"),
     ]),
     ("admin_roles", "Admin: XP Roles", "🏅", "Auto-assigning roles at XP milestones", [
         ("/addxprole xp: role: [exclusive]", "Auto-assign a role at an XP threshold"),
@@ -3531,6 +3604,52 @@ async def before_rotate_presence():
     await bot.wait_until_ready()
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Catch-all for any command error — discord.py calls this after
+    EVERY command error, in a finally block, regardless of whether a
+    per-command .error() handler already ran and successfully responded
+    (verified against discord.py's actual source, not assumed). So the
+    first thing this does is check whether something already responded;
+    if so, one of the ~50 per-command handlers already handled it and
+    there's nothing useful left to add — stepping in anyway would just
+    duplicate that same message a second time.
+
+    The case this actually exists for is the other one: a genuinely
+    unexpected bug, where no per-command handler recognized the error
+    and none of them sent a response. Without this, discord.py's default
+    behavior leaves the interaction hanging — the user sees Discord's
+    generic "This interaction failed" with zero explanation, and the
+    only record is whatever scrolled past in the console at that exact
+    moment. unwrap: an error raised inside a command arrives here
+    wrapped in CommandInvokeError; the actual exception is what's useful
+    to log."""
+    if interaction.response.is_done():
+        return  # already handled (or already replied) elsewhere — nothing more to do
+
+    original = getattr(error, "original", error)
+
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        message = "You need the **Manage Server** permission to use this command."
+    elif isinstance(error, app_commands.CheckFailure):
+        message = str(error) or "You don't have permission to use this command."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = f"That's being used too quickly — try again in {error.retry_after:.0f}s."
+    else:
+        message = (
+            "Something went wrong running that command. This has been logged — if it keeps happening, "
+            "let the bot owner know what you were trying to do."
+        )
+        print(f"Unhandled error in /{interaction.command.name if interaction.command else '?'}: {original!r}")
+        import traceback
+        traceback.print_exception(type(original), original, original.__traceback__)
+
+    try:
+        await interaction.response.send_message(message, ephemeral=True)
+    except (discord.HTTPException, discord.InteractionResponded):
+        pass  # interaction token expired, or something else responded in the tiny window since the is_done() check above
+
+
 @bot.event
 async def on_ready():
     try:
@@ -3543,6 +3662,23 @@ async def on_ready():
         print(f"Synced {len(synced)} commands. Logged in as {bot.user}.")
     except Exception as e:
         print(f"Sync error: {e}")
+
+    # Logs exactly who is_bot_owner() (used to gate /setstoreurl,
+    # /addpremiumguild, etc.) currently recognizes as an owner — console
+    # only, never sent to Discord. Useful any time "why does this account
+    # have owner access" needs a definitive answer instead of a guess:
+    # a team-owned application treats EVERY team member as an owner for
+    # this check, regardless of their role on the team, which is easy to
+    # forget about if an alt account was ever added to the team.
+    try:
+        app_info = await bot.application_info()
+        if app_info.team:
+            member_list = ", ".join(f"{m.name} ({m.id})" for m in app_info.team.members)
+            print(f"Owner check: TEAM-owned app — every member below counts as an owner: {member_list}")
+        else:
+            print(f"Owner check: personal app — owner is {app_info.owner} ({app_info.owner.id})")
+    except discord.HTTPException as e:
+        print(f"Couldn't fetch application info for the owner check log: {e}")
 
     if not scheduled_checks.is_running():
         scheduled_checks.start()
@@ -3968,6 +4104,7 @@ async def _render_member_profile(
     card_buf = await build_profile_card(
         member, render_entry, stats, guild_data["requirement"], rank, total_members,
         rank_change=rank_change, banner=banner, animation_allowed=animation_allowed,
+        personal_bests=get_personal_bests(entry),
     )
     will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
     filename = "profile.gif" if will_animate else "profile.png"
@@ -4536,6 +4673,85 @@ async def resetweek(interaction: discord.Interaction, user: discord.Member):
     save_data(data)
     await log_admin_action(interaction.guild, guild_data, interaction.user, "Reset weekly window", target=user.mention)
     await interaction.response.send_message(f"Weekly tracking window reset for {user.display_name}.")
+
+
+@bot.tree.command(name="analytics", description="[Admin] Server-wide activity analytics — retention, most active day, and more")
+@app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
+async def analytics_cmd(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    users = guild_data["users"]
+
+    if not users:
+        await interaction.response.send_message("No tracked members yet — nothing to analyze.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    now = utcnow()
+    this_week_start = now - timedelta(days=7)
+    last_week_start = now - timedelta(days=14)
+
+    total_members = len(users)
+    active_this_week = 0
+    active_last_week = 0
+    weekday_counts = [0] * 7  # index 0 = Monday, matches datetime.weekday()
+    total_gained_this_week = 0
+    top_gainer_uid, top_gain = None, -1
+
+    for uid, entry in users.items():
+        stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+        gained = stats["gained_this_week"]
+        total_gained_this_week += max(gained, 0)
+        if gained > top_gain:
+            top_gainer_uid, top_gain = uid, gained
+
+        checked_this_week = checked_last_week = False
+        for c in entry.get("checkins", []):
+            t = parse_iso(c["time"])
+            weekday_counts[t.weekday()] += 1
+            if t >= this_week_start:
+                checked_this_week = True
+            elif t >= last_week_start:
+                checked_last_week = True
+        if checked_this_week:
+            active_this_week += 1
+        if checked_last_week:
+            active_last_week += 1
+
+    retention_pct = (active_this_week / active_last_week * 100) if active_last_week > 0 else None
+    avg_gain = (total_gained_this_week / active_this_week) if active_this_week > 0 else 0
+    weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    most_active_day = weekday_names[weekday_counts.index(max(weekday_counts))] if any(weekday_counts) else "Not enough data yet"
+
+    top_gainer_member = interaction.guild.get_member(int(top_gainer_uid)) if top_gainer_uid else None
+    top_gainer_name = top_gainer_member.display_name if top_gainer_member else "Unknown member"
+
+    embed = discord.Embed(title="📊 Server Analytics", color=discord.Color.blurple())
+    embed.add_field(name="Tracked Members", value=str(total_members), inline=True)
+    embed.add_field(
+        name="Active This Week",
+        value=f"{active_this_week} ({active_this_week / total_members * 100:.0f}%)",
+        inline=True,
+    )
+    embed.add_field(
+        name="Retention vs Last Week",
+        value=f"{retention_pct:.0f}%" if retention_pct is not None else "Not enough data yet",
+        inline=True,
+    )
+    embed.add_field(name="Avg Gain (Active Members)", value=f"{avg_gain:,.0f} XP", inline=True)
+    embed.add_field(name="Most Active Day", value=most_active_day, inline=True)
+    embed.add_field(
+        name="Top Gainer This Week",
+        value=f"{top_gainer_name} (+{top_gain:,})" if top_gain > 0 else "No gains recorded yet",
+        inline=True,
+    )
+    embed.set_footer(
+        text="Based on stored checkin history — very long-tracked, very active members may have older "
+             "checkins aged out (see MAX_CHECKINS_STORED), which can skew retention/most-active-day slightly."
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="backup", description="[Admin] Download a full backup of ALL settings and tracked data for this server")
@@ -5750,6 +5966,7 @@ toggleinactivitybehindpace.error(_perm_or_premium_error)
 toggleleaderboardpagination.error(_perm_error)
 exportdata.error(_perm_or_premium_error)
 undoimport.error(_perm_or_premium_error)
+analytics_cmd.error(_perm_or_premium_error)
 backup_cmd.error(_perm_or_premium_error)
 restore_cmd.error(_perm_or_premium_error)
 togglerecentrate.error(_perm_error)
