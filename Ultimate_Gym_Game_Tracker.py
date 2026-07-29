@@ -2715,6 +2715,7 @@ HELP_CATEGORIES = [
         ("/clearinactivitychannel", "Turn off inactivity pings"),
         ("/setinactivitythreshold days: hours: minutes:", "How early the inactivity ping fires"),
         ("/toggleinactivitybehindpace enabled:", "Also flag people behind pace, not just zero-checkins"),
+        ("/pingbehindpace", "Immediately ping everyone checked in but behind pace, right now"),
     ]),
 ]
 
@@ -5012,6 +5013,49 @@ async def toggleinactivitybehindpace(interaction: discord.Interaction, enabled: 
     await interaction.response.send_message(msg)
 
 
+@bot.tree.command(
+    name="pingbehindpace",
+    description="[Admin] Immediately ping everyone who's checked in this week but isn't on track yet",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+@require_premium()
+@require_tracking_channel()
+async def pingbehindpace(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+
+    if not guild_data["users"]:
+        await interaction.response.send_message("No one is being tracked yet.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # Same bucketing as the automatic scheduled inactivity ping (see
+    # scheduled_checks) — "behind pace" specifically means they HAVE
+    # checked in this week but aren't on track, distinct from people with
+    # zero checkins at all (that's a separate concept, still only
+    # surfaced by the automatic ping via /setinactivitychannel).
+    behind_pace_members = []
+    for uid, entry in guild_data["users"].items():
+        stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+        member = interaction.guild.get_member(int(uid))
+        if not member:
+            continue
+        if stats["checkins_this_week"] > 0 and not stats["on_track"]:
+            behind_pace_members.append(member)
+    save_data(data)  # persist any lazy rollover triggered by compute_stats above
+
+    if not behind_pace_members:
+        await interaction.followup.send("Nobody's currently behind pace — everyone who's checked in this week is on track. 🎉")
+        return
+
+    mentions = " ".join(m.mention for m in behind_pace_members)
+    await interaction.followup.send(
+        f"⏰ **Behind-pace reminder** — checked in this week, but not yet on track to hit the requirement:\n"
+        f"{mentions}\n\nRun `/checkin` to update your progress!"
+    )
+
+
 @bot.tree.command(name="toggleleaderboardpagination", description="[Admin] Use Previous/Next buttons instead of truncating long leaderboards")
 @app_commands.describe(enabled="True for paginated Previous/Next browsing, false for a single truncated embed")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -6356,6 +6400,7 @@ addproduct.error(_channel_error)
 removeproduct.error(_channel_error)
 setinactivitythreshold.error(_perm_or_premium_error)
 toggleinactivitybehindpace.error(_perm_or_premium_error)
+pingbehindpace.error(_perm_or_premium_error)
 toggleleaderboardpagination.error(_perm_error)
 exportdata.error(_perm_or_premium_error)
 undoimport.error(_perm_or_premium_error)

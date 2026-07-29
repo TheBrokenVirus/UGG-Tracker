@@ -123,6 +123,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/clearinactivitychannel` | Admin ⭐ | Turn off inactivity reminder pings. |
 | `/setinactivitythreshold days: hours: minutes:` | Admin ⭐ | How long before week-end the inactivity ping fires (default: 24 hours). |
 | `/toggleinactivitybehindpace enabled:<true/false>` | Admin ⭐ | Whether inactivity pings also include people who checked in but are behind pace, not just people with zero checkins (default: off — zero checkins only). |
+| `/pingbehindpace` | Admin ⭐ | Immediately pings everyone who's checked in this week but isn't on track — an on-demand version of the behind-pace half of the automatic inactivity ping, for whenever you don't want to wait for it. |
 | `/toggleleaderboardpagination enabled:<true/false>` | Admin | Switch leaderboards between Previous/Next paging and the default single truncated embed. |
 | `/setbaseline user:<@user> starting_xp:<number>` | Admin | Set or correct someone's all-time starting XP — this is what `/totalleaderboard` calculates total gain from. |
 | `/importxp file:<.csv or .xlsx> [existing_users] [announce_milestones]` | Admin ⭐ | Bulk-set XP for many users at once from a spreadsheet. `existing_users` controls what happens to people already tracked: skip (default), check in (mass check-in, keeps history), or reset. `announce_milestones` (default: no) controls whether XP role milestones hit during this import get posted publicly. See below. |
@@ -506,6 +507,8 @@ As the week nears its end, the bot @mentions relevant members in the channel you
 ```
 
 With this on, the ping message splits into two clearly labeled groups — "haven't checked in at all" and "checked in, but behind pace" — so it's obvious which situation each person is in rather than lumping everyone into one undifferentiated list.
+
+**Don't want to wait for the scheduled ping?** `/pingbehindpace` does the "behind pace" half of this on demand, right now, regardless of `/toggleinactivitybehindpace`'s setting or how close the week is to ending — useful for a mid-week nudge rather than only at the automatic threshold. It only ever pings people who've checked in but aren't on track; it doesn't touch the "zero checkins" group, which stays exclusive to the automatic ping.
 
 Run `/clearinactivitychannel` to turn pings off entirely.
 
