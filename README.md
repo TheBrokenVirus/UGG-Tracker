@@ -106,7 +106,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/listpremiumguilds` | Owner | Shows every server with Premium, split into free (exempt) and paid (subscribed). |
 | `/exportdata [file_format]` | Admin ⭐ | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin ⭐ | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
-| `/restore file:<.json>` | Admin ⭐ | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. |
+| `/restore file:<.json>` | Admin | Restores everything from a `/backup` file. Replaces the entire server's data — confirmation required. Not Premium-gated — see "Backup & restore" below for why. |
 | `/analytics` | Admin ⭐ | Server-wide activity: retention week-over-week, most active day, top gainer, average gain. See below. |
 | `/setadminlogchannel channel:<#channel>` | Admin | Log destructive/data-altering admin actions to a channel. See below. |
 | `/clearadminlogchannel` | Admin | Turn off admin action logging. |
@@ -294,6 +294,8 @@ Downloads a JSON file containing **everything**: every setting in `/settings`, e
 Uploads that file back and **completely replaces** the server's current settings and tracked data with it — shows you how many users are in the backup and when it was taken before asking for confirmation, since this discards everything that's happened since that backup, not just undoes one action. This is real disaster-recovery, not the scoped undo that `/undoimport` provides for a single import.
 
 A backup taken with an older version of the bot (missing settings that didn't exist yet) restores fine — any keys not present in the file get filled in with current defaults rather than causing an error.
+
+**`/restore` is deliberately not Premium-gated, even though `/backup` is.** Premium status lives in the same shared data file as everything else — if that file is ever lost (a botched redeploy, a host wiping storage, etc.), the server's premium status is lost right along with it, which would make `/restore` itself unreachable at exactly the moment it's needed most: fixing a lost data file requires premium, but premium was part of what got lost. Since actually running `/restore` requires already possessing a legitimate backup file for that specific server — which only exists if the server was using the bot in the first place — there's no real exploit here, just closing off a lockout trap. The bot owner also always passes any Premium check regardless (see `require_premium()` in the code), as a second layer of the same protection.
 
 ## Analytics
 

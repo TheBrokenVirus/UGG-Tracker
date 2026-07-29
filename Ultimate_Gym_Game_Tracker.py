@@ -232,8 +232,19 @@ def require_premium():
     access (exempt or subscribed — see is_guild_premium). Distinct from
     is_bot_owner(): this is about which SERVER gets the feature, not
     which USER is running the command — any admin in a premium server can
-    use these, same as any other admin command."""
+    use these, same as any other admin command.
+
+    The bot owner always passes this check, regardless of premium status.
+    This isn't a loophole, it's a deliberate safety valve: premium status
+    lives in the same data file as everything else, so if that file is
+    ever lost or reset, the server's premium exemption is lost right
+    along with it — which would otherwise make /restore itself
+    unreachable, since restoring is exactly what's needed to fix a lost
+    data file in the first place. Without this bypass, that's a genuine
+    lockout with no way out except editing the data file by hand."""
     async def predicate(interaction: discord.Interaction) -> bool:
+        if await bot.is_owner(interaction.user):
+            return True
         data = load_data()
         if is_guild_premium(data, interaction.guild_id):
             return True
@@ -3652,6 +3663,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @bot.event
 async def on_ready():
+    if DATA_FILE.exists():
+        print(f"Data file found: {DATA_FILE} ({DATA_FILE.stat().st_size:,} bytes).")
+    else:
+        print(
+            f"⚠️  WARNING: no data file found at {DATA_FILE} — starting completely fresh. "
+            f"If this server had tracked data before, this almost certainly means it didn't carry over "
+            f"from wherever this was deployed from (e.g. redeployed via a fresh git-based build, which "
+            f"never includes xp_data.json since it's gitignored on purpose). If you have a /backup file "
+            f"from before, restore it now with /restore before anyone checks in and starts overwriting "
+            f"what a restore would bring back."
+        )
+
     try:
         if GUILD_ID:
             guild_obj = discord.Object(id=int(GUILD_ID))
@@ -4788,7 +4811,6 @@ async def backup_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="restore", description="[Admin] Restore ALL settings and tracked data from a /backup file — replaces everything")
 @app_commands.describe(file="The .json file downloaded from /backup")
 @app_commands.checks.has_permissions(manage_guild=True)
-@require_premium()
 async def restore_cmd(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(thinking=True, ephemeral=True)
 
@@ -5968,7 +5990,7 @@ exportdata.error(_perm_or_premium_error)
 undoimport.error(_perm_or_premium_error)
 analytics_cmd.error(_perm_or_premium_error)
 backup_cmd.error(_perm_or_premium_error)
-restore_cmd.error(_perm_or_premium_error)
+restore_cmd.error(_perm_error)
 togglerecentrate.error(_perm_error)
 toggleanimatedprofile.error(_perm_error)
 togglecompactleaderboard.error(_perm_error)
