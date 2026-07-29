@@ -1190,13 +1190,19 @@ async def build_profile_card(
     font_bar_label = _find_profile_font(False, 23 * SCALE)
     font_badge = _find_profile_font(True, 20 * SCALE)
 
-    # A tier badge (see _draw_body) sits in the top-right corner when a
-    # banner tier applies — reserve extra width so a long display name
-    # truncates before it would run under the badge, instead of the two
-    # overlapping.
-    badge_reserve = 170 * SCALE if (banner is not None and banner.get("name")) else 0
-    max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
     _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+
+    # A tier badge (drawn below, in _draw_body) sits in the top-right
+    # corner when a banner tier applies — its exact pixel width is
+    # measured here (not guessed) so the name and milestone text reserve
+    # precisely enough room to truncate before running under it, however
+    # long the tier's name actually is, instead of a fixed guess that
+    # only happened to be wide enough for short names like "Elite".
+    badge_reserve = 0
+    if banner is not None and banner.get("name"):
+        badge_text_measured = banner["name"].upper()
+        badge_reserve = _measure_draw.textlength(badge_text_measured, font=font_badge) + 16 * SCALE * 2 + 20 * SCALE
+    max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
     display_name = _fit_text_to_width(_measure_draw, member.display_name, font_name, max_name_width)
 
     bar_x, bar_y = text_x, 362 * SCALE
@@ -1260,10 +1266,10 @@ async def build_profile_card(
         if next_milestone:
             needed, role_name = next_milestone
             milestone_font = _find_profile_font(False, 19 * SCALE)
-            draw.text(
-                (text_x, 178 * SCALE), f"{needed:,} XP to {role_name}",
-                font=milestone_font, fill=MUTED_TEXT,
+            milestone_text = _fit_text_to_width(
+                draw, f"{needed:,} XP to {role_name}", milestone_font, max_name_width,
             )
+            draw.text((text_x, 178 * SCALE), milestone_text, font=milestone_font, fill=MUTED_TEXT)
 
         stat_y = 230 * SCALE
         draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
@@ -3684,10 +3690,19 @@ async def progresschart(interaction: discord.Interaction, user: Optional[discord
 async def _render_member_profile(guild: discord.Guild, guild_data: dict, member: discord.Member) -> tuple:
     """Shared by /profile and the self-serve color picker below: computes
     rank, stats, next milestone, and banner tier for a member, then
-    renders their card. Returns (BytesIO, filename, banner) — banner is
-    handed back too so the caller can decide whether a customize panel
-    makes sense (only when the member holds no tier, since a tier's look
-    is fixed by design, not something to pick from a dropdown)."""
+    renders their card. Returns (BytesIO, filename, banner, milestone_content).
+
+    banner is handed back too so the caller can decide whether a
+    customize panel makes sense (only when the member holds no tier,
+    since a tier's look is fixed by design, not something to pick from a
+    dropdown).
+
+    milestone_content is a ready-to-send message string with a real,
+    clickable role mention (or None if there's no next milestone) —
+    the "X XP to {role}" text drawn on the card itself is just pixels
+    in an image, so it can never be an actual clickable Discord mention
+    no matter what it says; this is the accompanying message text that
+    actually is one, meant to be sent alongside the image."""
     entry = guild_data["users"][str(member.id)]
     ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
     rank = next((i + 1 for i, (uid, _) in enumerate(ranked) if uid == str(member.id)), len(ranked))
@@ -3695,12 +3710,16 @@ async def _render_member_profile(guild: discord.Guild, guild_data: dict, member:
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
 
     next_milestone = None
+    milestone_content = None
     exclusive_roles = [m for m in get_xp_roles(guild_data) if m["exclusive"] and m["xp"] > entry["current_xp"]]
     if exclusive_roles:
         next_mapping = exclusive_roles[0]  # get_xp_roles() returns them sorted ascending
         role_obj = guild.get_role(next_mapping["role_id"])
         role_name = role_obj.name if role_obj else "the next tier"
-        next_milestone = (next_mapping["xp"] - entry["current_xp"], role_name)
+        needed = next_mapping["xp"] - entry["current_xp"]
+        next_milestone = (needed, role_name)
+        if role_obj:
+            milestone_content = f"🎯 **{needed:,} XP** to {role_obj.mention}"
 
     rank_change = get_rank_change(entry, rank)
     animation_allowed = get_animated_profiles_enabled(guild_data)
@@ -3713,7 +3732,7 @@ async def _render_member_profile(guild: discord.Guild, guild_data: dict, member:
     )
     will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
     filename = "profile.gif" if will_animate else "profile.png"
-    return card_buf, filename, banner
+    return card_buf, filename, banner, milestone_content
 
 
 class ProfileColorSelect(discord.ui.Select):
@@ -3744,14 +3763,14 @@ class ProfileColorSelect(discord.ui.Select):
         entry["border_color"] = self.values[0]
 
         member = interaction.guild.get_member(view.target_id) or await interaction.guild.fetch_member(view.target_id)
-        card_buf, filename, banner = await _render_member_profile(interaction.guild, guild_data, member)
+        card_buf, filename, banner, milestone_content = await _render_member_profile(interaction.guild, guild_data, member)
         save_data(data)  # persists the color change plus any lazy rollover triggered inside the helper above
         # If a tier now applies (e.g. a role was added mid-session) the
         # picker no longer makes sense — drop it rather than leave a
         # dropdown that would silently do nothing useful.
         new_view = view if banner is None else None
         file = discord.File(fp=card_buf, filename=filename)
-        await interaction.response.edit_message(attachments=[file], view=new_view)
+        await interaction.response.edit_message(content=milestone_content, attachments=[file], view=new_view)
 
 
 class ProfileCustomizeView(discord.ui.View):
@@ -3788,7 +3807,7 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
 
     await interaction.response.defer(thinking=True)
 
-    card_buf, filename, banner = await _render_member_profile(interaction.guild, guild_data, target)
+    card_buf, filename, banner, milestone_content = await _render_member_profile(interaction.guild, guild_data, target)
     save_data(data)  # persist any lazy rollover triggered by compute_stats inside the helper above
     file = discord.File(fp=card_buf, filename=filename)
 
@@ -3796,10 +3815,12 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
     # when no tier applies — a tier's look is fixed by design (see
     # /addbannertier), so there's nothing to pick from a dropdown there.
     view = ProfileCustomizeView(interaction.guild_id, target.id) if (target.id == interaction.user.id and banner is None) else None
+    send_kwargs = {"file": file}
+    if milestone_content:
+        send_kwargs["content"] = milestone_content
     if view is not None:
-        await interaction.followup.send(file=file, view=view)
-    else:
-        await interaction.followup.send(file=file)
+        send_kwargs["view"] = view
+    await interaction.followup.send(**send_kwargs)
 
 
 @bot.tree.command(name="undo", description="Remove the most recent checkin (yours, or someone else's if you're an admin)")
