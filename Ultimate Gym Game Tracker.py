@@ -2297,6 +2297,8 @@ HELP_CATEGORIES = [
         ("/undo [user]", "Remove the most recent checkin"),
         ("/history [user]", "Last 10 checkins for a user"),
         ("/progresschart [user]", "XP-over-time line chart for a user"),
+        ("/profile [user]", "Rendered profile card — avatar, rank, border color, progress bar"),
+        ("/previewtier tier:", "See what a configured banner tier would look like on your card"),
     ]),
     ("leaderboards", "Leaderboards", "🏆", "Comparing progress across the crew", [
         ("/weeklyleaderboard", "This week's XP ranking"),
@@ -3848,30 +3850,43 @@ async def progresschart(interaction: discord.Interaction, user: Optional[discord
     await interaction.followup.send(embed=embed, file=file)
 
 
-async def _render_member_profile(guild: discord.Guild, guild_data: dict, member: discord.Member) -> tuple:
-    """Shared by /profile and the self-serve color picker below: computes
-    rank, stats, and banner tier for a member, then renders their card.
-    Returns (BytesIO, filename, banner) — banner is handed back too so
-    the caller can decide whether a customize panel makes sense (only
-    when the member holds no tier, since a tier's look is fixed by
-    design, not something to pick from a dropdown).
+async def _render_member_profile(
+    guild: discord.Guild, guild_data: dict, member: discord.Member, banner_override: Optional[dict] = None,
+) -> tuple:
+    """Shared by /profile, the self-serve color picker below, and
+    /previewtier: computes rank, stats, and banner tier for a member,
+    then renders their card. Returns (BytesIO, filename, banner) —
+    banner is handed back too so the caller can decide whether a
+    customize panel makes sense (only when the member holds no tier,
+    since a tier's look is fixed by design, not something to pick from a
+    dropdown).
 
     Banner tiers and custom border colors are a premium feature (see
     /setpremiumsku) — re-checked here at render time, not just when
     /addbannertier or /setbordercolor were originally run, so a lapsed
     subscription reverts everyone to the default look instead of the
-    customization quietly staying in effect forever."""
+    customization quietly staying in effect forever.
+
+    banner_override skips that resolution entirely and forces a specific
+    tier instead — used for /previewtier, which already gates on premium
+    itself before calling this, so no separate check is needed here for
+    that path."""
     entry = guild_data["users"][str(member.id)]
     ranked = sorted(guild_data["users"].items(), key=lambda kv: kv[1]["current_xp"], reverse=True)
     rank = next((i + 1 for i, (uid, _) in enumerate(ranked) if uid == str(member.id)), len(ranked))
     total_members = len(ranked)
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
 
-    is_premium = is_guild_premium(load_data(), guild.id)
     rank_change = get_rank_change(entry, rank)
     animation_allowed = get_animated_profiles_enabled(guild_data)
-    banner = get_member_banner_tier(guild_data, member) if is_premium else None
-    render_entry = entry if is_premium else {**entry, "border_color": DEFAULT_BORDER_COLOR}
+
+    if banner_override is not None:
+        banner = banner_override
+        render_entry = entry
+    else:
+        is_premium = is_guild_premium(load_data(), guild.id)
+        banner = get_member_banner_tier(guild_data, member) if is_premium else None
+        render_entry = entry if is_premium else {**entry, "border_color": DEFAULT_BORDER_COLOR}
 
     card_buf = await build_profile_card(
         member, render_entry, stats, guild_data["requirement"], rank, total_members,
@@ -3912,6 +3927,72 @@ async def profile_cmd(interaction: discord.Interaction, user: Optional[discord.M
     save_data(data)  # persist any lazy rollover triggered by compute_stats inside the helper above
     file = discord.File(fp=card_buf, filename=filename)
     await interaction.followup.send(file=file)
+
+
+async def _banner_tier_autocomplete(interaction: discord.Interaction, current: str):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    tiers = get_banner_tiers(guild_data)  # ascending priority; show highest-tier first
+    current_lower = current.lower()
+    return [
+        app_commands.Choice(name=t["name"], value=t["name"])
+        for t in reversed(tiers)
+        if current_lower in t["name"].lower()
+    ][:25]
+
+
+@bot.tree.command(
+    name="previewtier",
+    description="See what a configured banner tier would look like on your own profile card",
+)
+@app_commands.describe(tier="Which banner tier to preview — pick from what's configured in this server")
+@app_commands.autocomplete(tier=_banner_tier_autocomplete)
+@require_premium()
+@require_tracking_channel()
+async def previewtier(interaction: discord.Interaction, tier: str):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(interaction.user.id))
+
+    if entry is None:
+        await interaction.response.send_message(
+            "You need to `/checkin` at least once before there's a profile card to preview.", ephemeral=True
+        )
+        return
+
+    if Image is None:
+        await interaction.response.send_message(
+            "Profile cards require the `Pillow` package, which isn't installed. "
+            "Run `pip install Pillow` and restart the bot.",
+            ephemeral=True,
+        )
+        return
+
+    tiers = get_banner_tiers(guild_data)
+    matched = next((t for t in tiers if t["name"].lower() == tier.strip().lower()), None)
+    if matched is None:
+        await interaction.response.send_message(
+            f"No banner tier named \"{tier}\" is configured here. Use `/listbannertiers` to see what's available, "
+            f"or start typing to pick one from the suggestions.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    card_buf, filename, _ = await _render_member_profile(
+        interaction.guild, guild_data, interaction.user, banner_override=matched,
+    )
+    save_data(data)  # persist any lazy rollover triggered by compute_stats inside the helper above
+    file = discord.File(fp=card_buf, filename=filename)
+    await interaction.followup.send(
+        content=(
+            f"🔍 **Preview of the {matched['name']} tier** — this is what your card would look like with it, "
+            f"not your actual current profile. Only you can see this."
+        ),
+        file=file,
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="undo", description="Remove the most recent checkin (yours, or someone else's if you're an admin)")
@@ -5594,6 +5675,7 @@ setpremiumsku.error(_channel_error)
 addpremiumguild.error(_channel_error)
 removepremiumguild.error(_channel_error)
 listpremiumguilds.error(_channel_error)
+previewtier.error(_channel_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
 setweekprogress.error(_perm_error)
