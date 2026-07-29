@@ -59,14 +59,16 @@ weekly requirement (default: 20,000 XP/week).
 
 ## Commands
 
+**"Owner" below means restricted to the bot's Discord application owner specifically** (or its team, if the application is team-owned) — not "Manage Server" in whichever server the command is run in. This covers store/SKU commands since they're tied to *your* actual storefront and Discord Monetization SKUs, not something that makes sense for each server's own admins to reconfigure. Everything else uses normal per-server "Admin" permissions, so if you invite this bot to other servers, their own admins can manage their own tracking/roles/display settings without being able to touch your store setup. See "Packaging the bot for other servers" near the end of this document for more on this.
+
 | Command | Who | Description |
 |---|---|---|
 | `/help` | Everyone | Browse every command by category via a dropdown — works in any channel even if you've restricted others to one. |
 | `/store` | Everyone | Shows the product menu and a "Visit Store" link button, if one's configured. Also works in any channel. See below. |
-| `/setstoreurl url:<link>` | Admin | Sets where the `/store` button goes — your Ko-fi, a website, wherever purchases actually happen. |
-| `/clearstoreurl` | Admin | Removes the store link. |
-| `/addproduct name: price: [description] [emoji]` | Admin | Adds a product to the `/store` menu (max 25). |
-| `/removeproduct name:<exact name>` | Admin | Removes a product by its exact name. |
+| `/setstoreurl url:<link>` | Owner | Sets where the `/store` button goes — your Ko-fi, a website, wherever purchases actually happen. |
+| `/clearstoreurl` | Owner | Removes the store link. |
+| `/addproduct name: price: [description] [emoji]` | Owner | Adds a product to the `/store` menu (max 25). |
+| `/removeproduct name:<exact name>` | Owner | Removes a product by its exact name. |
 | `/settings` | Admin (Manage Server) | Opens an interactive panel with buttons and forms for everything below — no need to remember command syntax. See below. |
 | `/checkin xp:<number> [user]` | Everyone | Record current total XP. First checkin starts tracking. The `user` option lets an admin check in on someone else's behalf (e.g. if they can't use Discord themselves) — regular members can only check themselves in. |
 | `/status [user]` | Everyone | Show weekly progress, rate, and projection for yourself or another user. |
@@ -92,8 +94,8 @@ weekly requirement (default: 20,000 XP/week).
 | `/addbannertier role: name: mode: color1: [color2] priority:` | Admin | Ties a profile banner look to a role — e.g. a role your store/Ko-fi integration grants on purchase. See "Banner tiers" below. |
 | `/removebannertier role:<@role>` | Admin | Removes a role's banner tier. |
 | `/listbannertiers` | Everyone | Shows all configured banner tiers, their roles, and their colors. |
-| `/addskurole sku_id: role: name:` | Admin | Auto-grants a role while a member has an active Discord purchase/subscription for a SKU, and removes it when that ends. See "SKU role automation" below. |
-| `/removeskurole sku_id:<id>` | Admin | Stops auto-granting a role for a SKU. |
+| `/addskurole sku_id: role: name:` | Owner | Auto-grants a role while a member has an active Discord purchase/subscription for a SKU, and removes it when that ends. See "SKU role automation" below. |
+| `/removeskurole sku_id:<id>` | Owner | Stops auto-granting a role for a SKU. |
 | `/listskuroles` | Admin | Shows all configured SKU → role mappings. |
 | `/exportdata [file_format]` | Admin | Downloads everyone's current stats (XP, baseline, gains, last checkin) as a CSV or Excel file. |
 | `/backup` | Admin | Downloads a **complete** snapshot — every setting plus every tracked user, not just stats. See below. |
@@ -606,6 +608,18 @@ To customize the rotation text, edit the list inside `build_presence_statuses()`
   with nothing after it.
 - Data persists in `xp_data.json` next to `bot.py`. Back this file up if
   you care about historical data — deleting it wipes all tracking.
+
+## Packaging the bot for other servers
+
+The bot already supports being added to more than one server with no code changes — every setting (`requirement`, roles, banner tiers, channels, etc.) is stored per-server, so servers never see or affect each other's data or configuration. What needed deliberate handling was the **store and SKU commands** (`/setstoreurl`, `/clearstoreurl`, `/addproduct`, `/removeproduct`, `/addskurole`, `/removeskurole`): those aren't really "per-server settings" the way a weekly XP goal is — they're tied to *your* actual storefront and *your* Discord Monetization SKUs (configured once, application-wide, in the Developer Portal). If any admin in any server could reconfigure them, someone could point `/store`'s button at their own link, list fake products, or map a role to a real SKU ID and have it silently pick up entitlements from your actual paying customers. So those six commands — and their `/settings` panel equivalents — check specifically for **you** (or your team, if the application is team-owned), not "Manage Server" in whichever server the command happens to run in. Everything else stays normal per-server admin control.
+
+Two ways to get the bot into another server:
+
+**If you're adding it yourself** (e.g. your own alt server, or a community's admin invites you to set it up): go to the [Discord Developer Portal](https://discord.com/developers/applications) → your application → **OAuth2 → URL Generator**. Under **Scopes**, check `bot` and `applications.commands`. Under **Bot Permissions**, check at minimum `Send Messages`, `Embed Links`, `Use Slash Commands`, and `Manage Roles` (needed for XP roles, banner tiers, and SKU role automation). Copy the generated URL and open it — it'll prompt you to pick which server to add the bot to, same as any bot invite.
+
+**If you want other people to be able to add it to their own servers**: the same invite URL works for them too, as long as your application's **Bot → Public Bot** toggle (in the Developer Portal) is turned on. Share that URL however makes sense — your own server, a website, wherever. Whoever adds it will need "Manage Server" in their own server to complete the invite, same as any bot, but once it's in, their local admins only get the "Admin" commands from the table above — the store/SKU ones stay locked to you specifically, everywhere, automatically, with no per-server setup needed on your end.
+
+One thing worth knowing: `/settings` is an ephemeral response (only visible to whoever ran it) specifically so its buttons and dropdowns can't be seen or clicked by anyone else in the channel — Discord doesn't restrict component interactions to the original command invoker on its own, so a public settings message would otherwise let anyone who could see it attempt to click through it.
 
 ## Keeping it running
 

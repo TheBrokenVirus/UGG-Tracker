@@ -2773,20 +2773,38 @@ class StoreSettingsView(discord.ui.View):
         super().__init__(timeout=300)
         self.guild_id = guild_id
 
+    async def _reject_if_not_owner(self, interaction: discord.Interaction) -> bool:
+        """Returns True (and sends a rejection) if this isn't the bot's
+        owner — store/SKU settings are tied to the developer's own
+        monetization setup, not something each server configures for
+        itself; see /setstoreurl for the matching slash-command check."""
+        if await bot.is_owner(interaction.user):
+            return False
+        await interaction.response.send_message(
+            "Store settings are restricted to the bot's developer.", ephemeral=True,
+        )
+        return True
+
     @discord.ui.button(label="⬅ Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await go_settings_home(interaction, self.guild_id)
 
     @discord.ui.button(label="Set Store URL", style=discord.ButtonStyle.primary, emoji="🔗")
     async def set_store_url(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._reject_if_not_owner(interaction):
+            return
         await interaction.response.send_modal(StoreURLModal(self.guild_id))
 
     @discord.ui.button(label="Add Product", style=discord.ButtonStyle.primary, emoji="➕")
     async def add_product(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._reject_if_not_owner(interaction):
+            return
         await interaction.response.send_modal(AddProductModal(self.guild_id))
 
     @discord.ui.button(label="Remove Product", style=discord.ButtonStyle.secondary, emoji="➖")
     async def remove_product(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._reject_if_not_owner(interaction):
+            return
         data = load_data()
         guild_data = get_guild(data, self.guild_id)
         products = guild_data.get("store_products", [])
@@ -2965,6 +2983,26 @@ intents.members = True  # required so guild.members includes everyone, not just 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 GUILD_ID = os.environ.get("GUILD_ID")  # optional, for instant command sync during testing
+
+
+def is_bot_owner():
+    """Command decorator restricting a command to the bot's own
+    developer (or team, if the Discord application is team-owned) —
+    regardless of what permissions they hold in whatever server the
+    command is run in. Unlike @app_commands.checks.has_permissions,
+    which grants access to Manage Server holders in EVERY server the bot
+    is added to, this stays true to a single person/team across every
+    server. Uses discord.py's built-in ownership detection
+    (bot.is_owner), which resolves the application's owner or team
+    automatically via Discord — no ID needs to be hardcoded here."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if await bot.is_owner(interaction.user):
+            return True
+        raise app_commands.CheckFailure(
+            "This command is restricted to the bot's developer — it controls settings tied to the "
+            "official store/monetization setup, not something each server configures for itself."
+        )
+    return app_commands.check(predicate)
 
 
 SCHEDULER_INTERVAL_MINUTES = 15
@@ -3795,7 +3833,13 @@ async def settings_cmd(interaction: discord.Interaction):
     save_data(data)  # persist guild creation if this is the first time
     embed = build_settings_embed(guild_data)
     view = SettingsHomeView(interaction.guild_id)
-    await interaction.response.send_message(embed=embed, view=view)
+    # Ephemeral on purpose: none of the buttons/dropdowns below check who's
+    # clicking them (Discord doesn't restrict components to the original
+    # invoker automatically), so a public message here would let anyone
+    # who could see it in the channel click through and change settings,
+    # not just admins. Ephemeral means only the person who ran /settings
+    # can ever see or interact with it in the first place.
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @bot.tree.command(
@@ -4017,9 +4061,9 @@ async def clearadminlogchannel(interaction: discord.Interaction):
     await interaction.response.send_message("Admin action logging is now off.")
 
 
-@bot.tree.command(name="setstoreurl", description="[Admin] Set the link shown by /store's Visit Store button")
+@bot.tree.command(name="setstoreurl", description="[Owner] Set the link shown by /store's Visit Store button")
 @app_commands.describe(url="Full URL to your store — must start with http:// or https://")
-@app_commands.checks.has_permissions(manage_guild=True)
+@is_bot_owner()
 async def setstoreurl(interaction: discord.Interaction, url: str):
     url = url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
@@ -4035,8 +4079,8 @@ async def setstoreurl(interaction: discord.Interaction, url: str):
     await interaction.response.send_message(f"Store link set. `/store` will now show a button linking to {url}")
 
 
-@bot.tree.command(name="clearstoreurl", description="[Admin] Remove the store link")
-@app_commands.checks.has_permissions(manage_guild=True)
+@bot.tree.command(name="clearstoreurl", description="[Owner] Remove the store link")
+@is_bot_owner()
 async def clearstoreurl(interaction: discord.Interaction):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4045,14 +4089,14 @@ async def clearstoreurl(interaction: discord.Interaction):
     await interaction.response.send_message("Store link removed — `/store` will show the product menu without a button.")
 
 
-@bot.tree.command(name="addproduct", description="[Admin] Add a product to the /store menu")
+@bot.tree.command(name="addproduct", description="[Owner] Add a product to the /store menu")
 @app_commands.describe(
     name="Product name",
     price="Price, any format (e.g. $5, 500 Robux, Free)",
     description="What this product gives — optional",
     emoji="Emoji shown next to it — optional, defaults to 🛒",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@is_bot_owner()
 async def addproduct(
     interaction: discord.Interaction, name: str, price: str,
     description: str = "", emoji: str = "🛒",
@@ -4075,9 +4119,9 @@ async def addproduct(
     await interaction.response.send_message(f"Added **{name.strip()}** ({price.strip()}) to the store.")
 
 
-@bot.tree.command(name="removeproduct", description="[Admin] Remove a product from the /store menu")
+@bot.tree.command(name="removeproduct", description="[Owner] Remove a product from the /store menu")
 @app_commands.describe(name="Exact product name to remove — check /store for exact spelling")
-@app_commands.checks.has_permissions(manage_guild=True)
+@is_bot_owner()
 async def removeproduct(interaction: discord.Interaction, name: str):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -4883,14 +4927,14 @@ async def listbannertiers(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="addskurole",
-    description="[Admin] Auto-grant a role while a member has an active purchase/subscription for this SKU",
+    description="[Owner] Auto-grant a role while a member has an active purchase/subscription for this SKU",
 )
 @app_commands.describe(
     sku_id="The SKU's ID from the Discord Developer Portal's Monetization page",
     role="Role to grant while the member's entitlement for this SKU is active, and remove once it ends",
     name="A short label for your own reference (e.g. 'Elite Monthly') — shown in /listskuroles",
 )
-@app_commands.checks.has_permissions(manage_guild=True)
+@is_bot_owner()
 async def addskurole(interaction: discord.Interaction, sku_id: str, role: discord.Role, name: str):
     cleaned_sku = sku_id.strip()
     if not cleaned_sku.isdigit():
@@ -4917,9 +4961,9 @@ async def addskurole(interaction: discord.Interaction, sku_id: str, role: discor
     )
 
 
-@bot.tree.command(name="removeskurole", description="[Admin] Stop auto-granting a role for a SKU")
+@bot.tree.command(name="removeskurole", description="[Owner] Stop auto-granting a role for a SKU")
 @app_commands.describe(sku_id="The SKU ID to remove the mapping for")
-@app_commands.checks.has_permissions(manage_guild=True)
+@is_bot_owner()
 async def removeskurole(interaction: discord.Interaction, sku_id: str):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
@@ -5256,10 +5300,10 @@ setinactivitychannel.error(_perm_error)
 clearinactivitychannel.error(_perm_error)
 setadminlogchannel.error(_perm_error)
 clearadminlogchannel.error(_perm_error)
-setstoreurl.error(_perm_error)
-clearstoreurl.error(_perm_error)
-addproduct.error(_perm_error)
-removeproduct.error(_perm_error)
+setstoreurl.error(_channel_error)
+clearstoreurl.error(_channel_error)
+addproduct.error(_channel_error)
+removeproduct.error(_channel_error)
 setinactivitythreshold.error(_perm_error)
 toggleinactivitybehindpace.error(_perm_error)
 toggleleaderboardpagination.error(_perm_error)
@@ -5281,8 +5325,8 @@ setbordercolor.error(_perm_error)
 removebordercolor.error(_perm_error)
 addbannertier.error(_perm_error)
 removebannertier.error(_perm_error)
-addskurole.error(_perm_error)
-removeskurole.error(_perm_error)
+addskurole.error(_channel_error)
+removeskurole.error(_channel_error)
 listskuroles.error(_perm_error)
 fullreset.error(_perm_error)
 resetweek.error(_perm_error)
