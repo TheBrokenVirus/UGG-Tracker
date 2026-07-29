@@ -171,6 +171,8 @@ def default_guild_data() -> dict:
         "animated_profiles": True,
         "banner_tiers": [],
         "sku_roles": {},
+        "crew_level_base_xp": 1000,
+        "crew_level_growth_rate": 1.15,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -592,6 +594,52 @@ def get_personal_bests(entry: dict) -> dict:
         "best_day_date": entry.get("best_day_date"),
         "best_week_xp": entry.get("best_week_xp", 0),
         "best_week_date": entry.get("best_week_date"),
+    }
+
+def get_crew_level_formula(guild_data: dict) -> tuple:
+    """Backward-compatible getter — returns (base_xp, growth_rate) for
+    /crewlevel's exponential formula, set with /setcrewlevelformula."""
+    return guild_data.get("crew_level_base_xp", 1000), guild_data.get("crew_level_growth_rate", 1.15)
+
+CREW_LEVEL_MAX = 100  # matches the reference spreadsheet's table range
+
+def cumulative_xp_for_level(level: int, base: float, growth: float) -> float:
+    """Total combined crew XP required to REACH `level`, starting at 0 XP
+    for level 1 — the same geometric-series formula as the Crew Level
+    Tracker spreadsheet's "Cumulative XP Required" column, so manually
+    calibrating base/growth in that spreadsheet against known in-game
+    level-up points and then setting the same two numbers here with
+    /setcrewlevelformula produces identical results in both places."""
+    if level <= 1:
+        return 0.0
+    if growth == 1:
+        return base * (level - 1)
+    return base * ((growth ** (level - 1)) - 1) / (growth - 1)
+
+def compute_crew_level(total_xp: float, base: float, growth: float) -> dict:
+    """Finds the crew's current level for total_xp against the
+    exponential curve, plus how far into the next level they are.
+    Returns a dict with level, current_threshold, next_threshold (None
+    if CREW_LEVEL_MAX has been exceeded), progress (0-1, None if maxed),
+    and xp_remaining (None if maxed)."""
+    level = 1
+    for candidate in range(1, CREW_LEVEL_MAX + 1):
+        if cumulative_xp_for_level(candidate, base, growth) <= total_xp:
+            level = candidate
+        else:
+            break
+    current_threshold = cumulative_xp_for_level(level, base, growth)
+    maxed = level >= CREW_LEVEL_MAX
+    next_threshold = None if maxed else cumulative_xp_for_level(level + 1, base, growth)
+    if maxed:
+        progress, xp_remaining = None, None
+    else:
+        xp_needed_for_level = next_threshold - current_threshold
+        progress = (total_xp - current_threshold) / xp_needed_for_level if xp_needed_for_level > 0 else 1.0
+        xp_remaining = next_threshold - total_xp
+    return {
+        "level": level, "current_threshold": current_threshold, "next_threshold": next_threshold,
+        "progress": progress, "xp_remaining": xp_remaining, "maxed": maxed,
     }
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1129,26 @@ def _fit_text_to_width(draw: "ImageDraw.ImageDraw", text: str, font, max_width: 
         text = text[:-1]
     return (text + "…") if text else "…"
 
+def _fit_name_to_width(
+    draw: "ImageDraw.ImageDraw", text: str, bold: bool, base_size: int, min_size: int, max_width: float,
+):
+    """Shrinks the font size in steps to fit the FULL name within
+    max_width before ever truncating it, down to min_size — so a long
+    display name reads completely at a smaller size instead of getting
+    cut short with an ellipsis at the default size the way shorter names
+    render at. Only falls back to truncation (see _fit_text_to_width) if
+    even min_size still doesn't fit. Returns (font, text) — text is
+    unchanged unless that final fallback kicks in."""
+    size = base_size
+    step = max(int(base_size * 0.06), 1)
+    while size > min_size:
+        font = _find_profile_font(bold, size)
+        if draw.textlength(text, font=font) <= max_width:
+            return font, text
+        size -= step
+    font = _find_profile_font(bold, min_size)
+    return font, _fit_text_to_width(draw, text, font, max_width)
+
 def _rotate_hue(rgb: tuple, degrees: float) -> tuple:
     """Returns rgb rotated around the hue wheel by degrees (0-360), keeping
     lightness and saturation unchanged — used to animate the profile card's
@@ -1214,20 +1282,27 @@ def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
     return daily_rank - current_rank
 
 # Animated profile cards: a full hue rotation happens over roughly
-# ANIMATED_PROFILE_FRAMES * ANIMATED_PROFILE_FRAME_MS milliseconds (52 * 105
+# ANIMATED_PROFILE_FRAMES * ANIMATED_PROFILE_FRAME_MS milliseconds (26 * 210
 # ≈ 5.5s per loop) — slow and smooth is intentional, since a fast color
 # cycle reads as flashing/strobing rather than a nice glow, and could be
-# uncomfortable for motion/light-sensitive users. Frame count is doubled
-# from the original 26 for a finer hue step between frames — affordable
-# because only the border/ring/bar-fill actually differ frame to frame
-# (see render_solid_frame's tint_background=False path below); the
-# background and text staying byte-identical keeps each extra frame
-# cheap to add to the GIF instead of scaling the file size linearly.
+# uncomfortable for motion/light-sensitive users.
+#
+# This was briefly doubled to 52 frames for a finer hue step, reasoning
+# that it was "cheap" since the background/text stay identical across
+# frames and compress well in the final GIF. That reasoning only applies
+# to the OUTPUT FILE SIZE — it ignored that memory during rendering scales
+# with frame count regardless of how well the result compresses, and with
+# three separate full-resolution frame lists alive at once (since fixed —
+# see build_profile_card's _render_sync), 52 frames was enough to exhaust
+# available memory in production. Back to 26 frames, and the rendering
+# pipeline itself no longer holds more than one full-length frame list at
+# a time regardless of count.
+#
 # Rendered at a lower supersampling factor than the static card (3x vs
 # 5x) since it's paid for once per frame instead of once total — still
 # enough headroom for clean edges after the downscale to FINAL_W/FINAL_H.
-ANIMATED_PROFILE_FRAMES = 52
-ANIMATED_PROFILE_FRAME_MS = 105
+ANIMATED_PROFILE_FRAMES = 26
+ANIMATED_PROFILE_FRAME_MS = 210
 ANIMATED_PROFILE_SCALE = 3
 STATIC_PROFILE_SCALE = 5
 
@@ -1345,7 +1420,8 @@ async def build_profile_card(
         grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
 
         text_x = 35 * SCALE + avatar_size + 45 * SCALE
-        font_name = _find_profile_font(True, 52 * SCALE)
+        NAME_BASE_SIZE = 52 * SCALE
+        NAME_MIN_SIZE = 32 * SCALE  # floor before it starts truncating instead of shrinking further
         font_rank = _find_profile_font(True, 34 * SCALE)
         font_change = _find_profile_font(True, 24 * SCALE)
         font_stat_label = _find_profile_font(False, 23 * SCALE)
@@ -1366,7 +1442,13 @@ async def build_profile_card(
             badge_text_measured = banner["name"].upper()
             badge_reserve = _measure_draw.textlength(badge_text_measured, font=font_badge) + 16 * SCALE * 2 + 20 * SCALE
         max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
-        display_name = _fit_text_to_width(_measure_draw, display_name_raw, font_name, max_name_width)
+        # Long names shrink to fit in full before ever getting truncated —
+        # see _fit_name_to_width. Short names are completely unaffected,
+        # since the loop there returns immediately once the name already
+        # fits at the base size.
+        font_name, display_name = _fit_name_to_width(
+            _measure_draw, display_name_raw, True, NAME_BASE_SIZE, NAME_MIN_SIZE, max_name_width,
+        )
 
         bar_x, bar_y = text_x, 362 * SCALE
         bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 28 * SCALE
@@ -1570,18 +1652,9 @@ async def build_profile_card(
             buf.seek(0)
             return buf
 
-        fixed_rank_text = GOLD_ACCENT if rank == 1 else _readable_text_variant(color1_rgb)
-        frames_rgba = [
-            render_solid_frame(
-                _rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES)),
-                tint_background=False, rank_text_override=fixed_rank_text,
-            )
-            for i in range(ANIMATED_PROFILE_FRAMES)
-        ]
-
         # GIF has no real alpha channel — only one palette color can be marked
-        # "transparent" per frame. Plainly converting the RGBA frames above to
-        # RGB would turn the rounded corners (currently fully transparent, alpha
+        # "transparent" per frame. Plainly converting an RGBA frame to RGB
+        # would turn the rounded corners (currently fully transparent, alpha
         # 0) into solid black squares, since dropping alpha just keeps the
         # underlying R/G/B values as-is. Instead, every pixel below the alpha
         # threshold gets overwritten with one reserved sentinel color first —
@@ -1601,7 +1674,28 @@ async def build_profile_card(
             rgb.paste(Image.new("RGB", rgba_frame.size, CORNER_KEY_RGB), mask=transparent_mask)
             return rgb
 
-        frames = [_flatten_with_transparency_key(f) for f in frames_rgba]
+        # Rendered and flattened one frame at a time rather than building
+        # frames_rgba/frames/quantized as three separate full-length lists —
+        # holding three full copies of every frame simultaneously (RGBA, then
+        # RGB, then palette-mode) at once was genuinely exhausting available
+        # memory in production, not just slow. This keeps only ONE full-size
+        # list (the flattened RGB frames) alive at a time; the RGBA version
+        # for each frame is discarded immediately after flattening, and a
+        # thumbnail for palette-building is collected in the same pass so
+        # there's no second full-resolution pass needed for that either.
+        fixed_rank_text = GOLD_ACCENT if rank == 1 else _readable_text_variant(color1_rgb)
+        thumb_w, thumb_h = 160, int(160 * FINAL_H / FINAL_W)
+        frames = []
+        thumbnails = []
+        for i in range(ANIMATED_PROFILE_FRAMES):
+            rgba_frame = render_solid_frame(
+                _rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES)),
+                tint_background=False, rank_text_override=fixed_rank_text,
+            )
+            rgb_frame = _flatten_with_transparency_key(rgba_frame)
+            del rgba_frame  # done with it — only the flattened version is needed from here on
+            thumbnails.append(rgb_frame.resize((thumb_w, thumb_h), Image.BILINEAR))
+            frames.append(rgb_frame)
 
         # GIF frames all need to share one 256-color palette — quantizing each
         # frame independently would let every frame pick slightly different
@@ -1612,13 +1706,13 @@ async def build_profile_card(
         # animation it doesn't look like smooth shading — it looks like
         # static/noise crawling over the card as frames change. A flat
         # nearest-color match keeps every frame visually stable; the palette
-        # being well-covered is what keeps that from banding badly. Each frame
-        # contributes a small thumbnail rather than its full-resolution self —
-        # same color distribution for palette purposes, far less work.
-        thumb_w, thumb_h = 160, int(160 * frames[0].height / frames[0].width)
-        strip = Image.new("RGB", (thumb_w * len(frames), thumb_h))
-        for i, frame in enumerate(frames):
-            strip.paste(frame.resize((thumb_w, thumb_h), Image.BILINEAR), (i * thumb_w, 0))
+        # being well-covered is what keeps that from banding badly. Thumbnails
+        # (already collected above, no extra full-resolution work) stand in
+        # for the full frames — same color distribution for palette purposes.
+        strip = Image.new("RGB", (thumb_w * len(thumbnails), thumb_h))
+        for i, thumb in enumerate(thumbnails):
+            strip.paste(thumb, (i * thumb_w, 0))
+        del thumbnails
         shared_palette = strip.quantize(colors=256, method=Image.MEDIANCUT)
 
         # Whichever palette index the sentinel color landed on is what gets
@@ -1628,16 +1722,33 @@ async def build_profile_card(
         key_probe = Image.new("RGB", (1, 1), CORNER_KEY_RGB).quantize(palette=shared_palette, dither=Image.NONE)
         transparent_index = key_probe.getpixel((0, 0))
 
-        quantized = [f.quantize(palette=shared_palette, dither=Image.NONE) for f in frames]
-        quantized[0].save(
-            buf, format="GIF", save_all=True, append_images=quantized[1:],
+        # Quantized in place, popping each RGB frame the moment its
+        # palette-mode replacement exists, instead of building a whole
+        # second full-length list while the first is still alive.
+        for i in range(len(frames)):
+            frames[i] = frames[i].quantize(palette=shared_palette, dither=Image.NONE)
+
+        frames[0].save(
+            buf, format="GIF", save_all=True, append_images=frames[1:],
             duration=ANIMATED_PROFILE_FRAME_MS, loop=0, disposal=2, transparency=transparent_index,
         )
+        del frames
         buf.seek(0)
         return buf
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _render_sync)
+    result = await loop.run_in_executor(None, _render_sync)
+    # Encourages CPython to actually return freed memory to the allocator's
+    # arenas promptly. This function runs in a persistent thread pool
+    # (run_in_executor's default executor reuses threads), and CPython
+    # doesn't always release memory from a burst of large, short-lived
+    # allocations back to the OS immediately on its own — over repeated
+    # /profile calls for rainbow-tier members, that can look like a slow
+    # memory leak even though every individual call is well-behaved.
+    if mode == "rainbow":
+        import gc
+        gc.collect()
+    return result
 
 # ---------------------------------------------------------------------------
 # Interactive settings panel (buttons, modals, select menus)
@@ -2460,6 +2571,7 @@ HELP_CATEGORIES = [
         ("/weeklyleaderboard", "This week's XP ranking"),
         ("/totalleaderboard", "All-time total XP ranking (includes starting point)"),
         ("/crewtotals", "Combined crew-wide totals, including departed members"),
+        ("/crewlevel", "Crew's in-game level, progress, and ETA to the next one"),
         ("/listxproles", "Show configured XP milestone roles"),
     ]),
     ("admin_core", "Admin: Requirement & Week", "⏱️", "Weekly goal, week sync, proration", [
@@ -2469,6 +2581,9 @@ HELP_CATEGORIES = [
         ("/setweekprogressall days: hours: minutes:", "Backdate everyone's week progress at once"),
         ("/resetweek user:<@user>", "Restart one user's weekly window right now"),
         ("/setproratethreshold days: hours: minutes:", "How late is \"late enough\" to prorate a first week"),
+    ]),
+    ("admin_crewlevel", "Admin: Crew Level", "🏰", "The exponential formula behind /crewlevel", [
+        ("/setcrewlevelformula base_xp: growth_rate:", "Set the level-1→2 XP and per-level growth rate"),
     ]),
     ("admin_users", "Admin: Users & Data", "👤", "Correcting, resetting, importing, exporting", [
         ("/setbaseline user: starting_xp:", "Set/correct someone's all-time starting XP"),
@@ -4020,6 +4135,106 @@ async def crewtotals(interaction: discord.Interaction):
     embed.add_field(name="Avg XP/Member This Week", value=f"{avg_weekly:,.0f}", inline=True)
     embed.set_footer(text="Includes members no longer in the server — their tracked XP still counts toward crew totals.")
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="crewlevel", description="Show the crew's level, progress to the next one, and an ETA based on recent pace")
+@require_tracking_channel()
+async def crewlevel_cmd(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+
+    if not guild_data["users"]:
+        await interaction.response.send_message("No one is being tracked yet. Use `/checkin` to get started.")
+        return
+
+    base, growth = get_crew_level_formula(guild_data)
+    total_xp = 0
+    combined_rate_per_day = 0.0
+    for uid, entry in guild_data["users"].items():
+        stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+        total_xp += entry["current_xp"]
+        # Each member's own rate can be negative right after a correction
+        # (e.g. /setbaseline) or simply noisy for someone brand new — floor
+        # at 0 per member so one bad number can't drag the whole crew's
+        # combined pace estimate negative.
+        combined_rate_per_day += max(stats["rate_per_day"], 0)
+    save_data(data)  # persist any lazy rollover triggered by compute_stats above
+
+    result = compute_crew_level(total_xp, base, growth)
+
+    embed = discord.Embed(title="🏰 Crew Level", color=discord.Color.gold())
+    embed.add_field(name="Current Level", value=str(result["level"]), inline=True)
+    embed.add_field(name="Total Crew XP", value=f"{total_xp:,}", inline=True)
+    embed.add_field(
+        name="Combined Rate",
+        value=f"{combined_rate_per_day:,.0f} XP/day" if combined_rate_per_day > 0 else "Not enough recent activity",
+        inline=True,
+    )
+
+    if result["maxed"]:
+        embed.add_field(
+            name="Progress",
+            value=f"Max level in this formula's range ({CREW_LEVEL_MAX}) reached! 🎉 Extend it with `/setcrewlevelformula` if your crew keeps climbing.",
+            inline=False,
+        )
+    else:
+        bar = build_progress_bar(total_xp - result["current_threshold"], result["next_threshold"] - result["current_threshold"])
+        embed.add_field(
+            name=f"Progress to Level {result['level'] + 1}",
+            value=f"{bar} {result['progress'] * 100:.1f}%\n{result['xp_remaining']:,.0f} XP remaining",
+            inline=False,
+        )
+        if combined_rate_per_day > 0:
+            days_left = result["xp_remaining"] / combined_rate_per_day
+            eta = utcnow() + timedelta(days=days_left)
+            embed.add_field(
+                name="Estimated Time to Next Level",
+                value=f"~{format_timedelta(timedelta(days=days_left))}, around <t:{int(eta.timestamp())}:D>",
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Estimated Time to Next Level",
+                value="Not enough recent activity across the crew to estimate a pace yet.",
+                inline=False,
+            )
+
+    embed.set_footer(
+        text=f"Formula: {base:,.0f} XP for level 1→2, {(growth - 1) * 100:.0f}% more each level after. "
+             f"Calibrate with /setcrewlevelformula if this doesn't match the real in-game level."
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="setcrewlevelformula", description="[Admin] Set the exponential formula /crewlevel uses to calculate crew level")
+@app_commands.describe(
+    base_xp="XP required to go from level 1 to level 2",
+    growth_rate="Multiplier for how much more each level needs than the last (e.g. 1.15 = 15% more per level)",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setcrewlevelformula(interaction: discord.Interaction, base_xp: int, growth_rate: float):
+    if base_xp <= 0:
+        await interaction.response.send_message("Base XP must be a positive number.", ephemeral=True)
+        return
+    if growth_rate <= 0:
+        await interaction.response.send_message("Growth rate must be a positive number — try something like 1.15.", ephemeral=True)
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["crew_level_base_xp"] = base_xp
+    guild_data["crew_level_growth_rate"] = growth_rate
+    save_data(data)
+
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Set crew level formula",
+        details=f"Base {base_xp:,} XP, growth {growth_rate}",
+    )
+    await interaction.response.send_message(
+        f"Crew level formula updated — **{base_xp:,} XP** for level 1→2, **{(growth_rate - 1) * 100:.0f}%** more "
+        f"required each level after that. Check `/crewlevel` against your crew's real in-game level to confirm "
+        f"these numbers are right — same calibration approach as the Crew Level Tracker spreadsheet."
+    )
 
 
 @bot.tree.command(name="history", description="Show recent XP checkins for a user")
@@ -5974,6 +6189,7 @@ clearchannel.error(_perm_error)
 setannouncechannel.error(_perm_or_premium_error)
 clearannouncechannel.error(_perm_or_premium_error)
 setweeklypost.error(_perm_error)
+setcrewlevelformula.error(_perm_error)
 clearweeklypost.error(_perm_error)
 setinactivitychannel.error(_perm_or_premium_error)
 clearinactivitychannel.error(_perm_or_premium_error)

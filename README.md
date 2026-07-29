@@ -77,6 +77,8 @@ weekly requirement (default: 20,000 XP/week).
 | `/weeklyleaderboard` | Everyone | Ranked list of everyone's XP gained *this week*, with on-track indicators. |
 | `/totalleaderboard` | Everyone | Ranked by each person's *actual total XP* (starting point + everything gained since), not just the gain alone. |
 | `/crewtotals` | Everyone | The whole crew's combined XP added together — total XP and this week's gain, summed across everyone tracked (including anyone no longer in the server). |
+| `/crewlevel` | Everyone | The crew's in-game level (an exponential formula, see below), progress to the next one, and an ETA based on the crew's combined recent pace. |
+| `/setcrewlevelformula base_xp: growth_rate:` | Admin | Sets the level-1→2 XP cost and the per-level growth rate `/crewlevel` uses. See "Crew level" below. |
 | `/history [user]` | Everyone | Last 10 checkins for a user. |
 | `/undo [user]` | Everyone (own checkins); Admin for others | Remove the most recent checkin and revert current XP to the one before it. If it was someone's only checkin, tracking resets entirely. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
@@ -296,6 +298,23 @@ Uploads that file back and **completely replaces** the server's current settings
 A backup taken with an older version of the bot (missing settings that didn't exist yet) restores fine — any keys not present in the file get filled in with current defaults rather than causing an error.
 
 **`/restore` is deliberately not Premium-gated, even though `/backup` is.** Premium status lives in the same shared data file as everything else — if that file is ever lost (a botched redeploy, a host wiping storage, etc.), the server's premium status is lost right along with it, which would make `/restore` itself unreachable at exactly the moment it's needed most: fixing a lost data file requires premium, but premium was part of what got lost. Since actually running `/restore` requires already possessing a legitimate backup file for that specific server — which only exists if the server was using the bot in the first place — there's no real exploit here, just closing off a lockout trap. The bot owner also always passes any Premium check regardless (see `require_premium()` in the code), as a second layer of the same protection.
+
+## Crew level
+
+```
+/crewlevel
+/setcrewlevelformula base_xp:1000 growth_rate:1.15
+```
+
+Roblox gym crews often have an in-game "crew level" that levels up as the crew's combined XP grows — this recreates that as a bot command, since the game itself doesn't expose it anywhere convenient to check. It's the same exponential math as the standalone **Crew Level Tracker** spreadsheet (a calculator built earlier in this project, kept as a separate tool since not everyone wants this wired into the bot) — set the same `base_xp`/`growth_rate` in both places and they'll always agree.
+
+**How the curve works:** `base_xp` is how much combined XP the crew needs to go from level 1 to level 2. `growth_rate` is how much *more* every level after that costs than the one before it, as a multiplier — `1.15` means each level needs 15% more than the last. This compounds fast: with those defaults, level 16 alone requires roughly 47,500 combined XP, not a simple 16× multiple of the base.
+
+**Calibrating it to match the real in-game numbers:** the defaults (1,000 / 1.15) are a starting guess, not a known-correct value — Roblox doesn't publish the actual formula. Run `/crewlevel`, compare the level it reports against your crew's real level in-game, and adjust `base_xp`/`growth_rate` with `/setcrewlevelformula` until they match. Two known real data points (e.g. "we were level 8 at X combined XP, hit level 9 at Y") pin down both numbers precisely — the same calibration approach the spreadsheet's "Calibration Check" cell is built around.
+
+**What "combined XP" means here:** the same definition as `/crewtotals`' "Total XP (crew)" — every tracked member's current XP added together, including members no longer in the server. Not `/totalxpgained`-style "since they started tracking" — this is the crew's actual current total, since that's what the real in-game level is presumably based on.
+
+**The ETA is a real projection, not a guess:** it sums each member's own current-week `rate_per_day` (the same rate `/status` shows individually) into one combined crew-wide daily rate, then divides the remaining XP to the next level by that rate. A member with a currently negative rate (e.g. right after an admin correction) is floored to 0 for this calculation rather than dragging the whole crew's estimate down — one person's data cleanup shouldn't make the ETA worse. If the crew's combined rate is 0 (no one's gained anything recently), it says so plainly instead of showing an infinite or nonsensical ETA.
 
 ## Analytics
 
