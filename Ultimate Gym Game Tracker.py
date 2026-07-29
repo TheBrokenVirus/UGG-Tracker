@@ -17,6 +17,7 @@ import io
 import json
 import math
 import colorsys
+import asyncio
 from pathlib import Path
 from typing import Optional, Literal
 from datetime import datetime, timedelta, timezone
@@ -93,6 +94,19 @@ def week_range_str(week_start_dt: datetime) -> str:
     start_ts, end_ts = int(week_start_dt.timestamp()), int(week_end_dt.timestamp())
     return f"<t:{start_ts}:D> → <t:{end_ts}:D>"
 
+def _csv_safe(value: str) -> str:
+    """Neutralizes CSV/Excel formula injection: a cell whose content
+    starts with =, +, -, or @ gets interpreted as a formula by Excel/
+    Sheets when the exported file is opened, not literal text. Discord
+    usernames are attacker-controlled (anyone can set theirs to
+    '=cmd|...' or similar), so this runs on any user-controlled string
+    before it goes into a CSV or Excel cell. Prefixing a single quote is
+    the standard mitigation — spreadsheet apps treat a leading quote as
+    "the rest of this is plain text," and it isn't visible once opened."""
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
 def build_progress_bar(current: float, target: float, length: int = 14) -> str:
     """Renders a simple text progress bar using block characters, e.g.
     '████████░░░░░░ 57%'. Clamps at 100% even if current exceeds target
@@ -116,8 +130,16 @@ def load_data() -> dict:
     return {"guilds": {}}
 
 def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w") as f:
+    # Written to a temp file and swapped in with os.replace rather than
+    # writing directly to xp_data.json — os.replace is atomic on both
+    # POSIX and Windows, so a crash, power loss, or kill mid-write can
+    # never leave a half-written/corrupted data file behind. Writing
+    # directly would risk exactly that: json.load() then fails on every
+    # subsequent command until someone notices and manually fixes the file.
+    tmp_path = DATA_FILE.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_path, DATA_FILE)
 
 DEFAULT_PRORATE_THRESHOLD_HOURS = 168.0  # 7 days = always prorate any lateness (original behavior)
 DEFAULT_INACTIVITY_THRESHOLD_HOURS = 24.0  # ping people who haven't checked in when this much time is left
@@ -1218,310 +1240,325 @@ async def build_profile_card(
     # Fetch avatar bytes directly through discord.py's Asset — no extra HTTP client needed
     try:
         avatar_bytes = await member.display_avatar.replace(size=256, format="png").read()
-        avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
     except (discord.HTTPException, discord.NotFound):
-        avatar_img = Image.new("RGBA", (256, 256), (88, 101, 242, 255))
+        avatar_bytes = None
+    display_name_raw = member.display_name
 
-    # Everything that doesn't depend on the border color is computed once,
-    # up front, and reused across every frame (there's only ever one frame
-    # for a static card) — masks, fonts, avatar resize, and text layout.
-    avatar_size = 240 * SCALE
-    avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
-    avatar_resized = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
-    avatar_mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(avatar_mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
-    ring_pad = 6 * SCALE
-
-    corner_mask = Image.new("L", (CARD_W, CARD_H), 0)
-    ImageDraw.Draw(corner_mask).rounded_rectangle([0, 0, CARD_W - 1, CARD_H - 1], radius=24 * SCALE, fill=255)
-    # Left-to-right gradient mask, bright (255) on the left where the
-    # avatar ring sits, fading to dark (0) on the right — reused both for
-    # the subtle single-color background tint (solid/rainbow modes) and
-    # as the blend between color1/color2 (gradient mode).
-    grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
-
-    text_x = 35 * SCALE + avatar_size + 45 * SCALE
-    font_name = _find_profile_font(True, 52 * SCALE)
-    font_rank = _find_profile_font(True, 34 * SCALE)
-    font_change = _find_profile_font(True, 24 * SCALE)
-    font_stat_label = _find_profile_font(False, 23 * SCALE)
-    font_stat_value = _find_profile_font(True, 34 * SCALE)
-    font_bar_label = _find_profile_font(False, 23 * SCALE)
-    font_badge = _find_profile_font(True, 20 * SCALE)
-
-    _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-
-    # A tier badge (drawn below, in _draw_body) sits in the top-right
-    # corner when a banner tier applies — its exact pixel width is
-    # measured here (not guessed) so the name and milestone text reserve
-    # precisely enough room to truncate before running under it, however
-    # long the tier's name actually is, instead of a fixed guess that
-    # only happened to be wide enough for short names like "Elite".
-    badge_reserve = 0
-    if banner is not None and banner.get("name"):
-        badge_text_measured = banner["name"].upper()
-        badge_reserve = _measure_draw.textlength(badge_text_measured, font=font_badge) + 16 * SCALE * 2 + 20 * SCALE
-    max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
-    display_name = _fit_text_to_width(_measure_draw, member.display_name, font_name, max_name_width)
-
-    bar_x, bar_y = text_x, 362 * SCALE
-    bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 28 * SCALE
-    effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
-    pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
-    fill_w = max(int(bar_w * pct), bar_h) if pct > 0 else 0
-
-    def _tint(base_rgb, accent_rgb, ratio):
-        return tuple(int(base_rgb[i] * (1 - ratio) + accent_rgb[i] * ratio) for i in range(3))
-
-    def _draw_body(card: "Image.Image", draw: "ImageDraw.ImageDraw", rank_text_rgb: tuple):
-        """Everything that isn't the background/border/bar fill — avatar,
-        name, rank, milestone text, stats, tier badge. Identical across
-        every mode."""
-        draw.text((text_x, 44 * SCALE), display_name, font=font_name, fill=WHITE)
-
-        if banner is not None and banner.get("name"):
-            badge_text = banner["name"].upper()
-            badge_bg = _hex_to_rgb(banner["color1"]) + (255,)
-            badge_fg = _contrast_text_color(badge_bg)
-            pad_x, pad_y = 16 * SCALE, 8 * SCALE
-            text_w = draw.textlength(badge_text, font=font_badge)
-            badge_h = 20 * SCALE + pad_y * 2
-            badge_w = text_w + pad_x * 2
-            badge_x2 = CARD_W - 26 * SCALE
-            badge_x1 = badge_x2 - badge_w
-            badge_y1 = 26 * SCALE
-            draw.rounded_rectangle(
-                [badge_x1, badge_y1, badge_x2, badge_y1 + badge_h], radius=badge_h / 2, fill=badge_bg,
-            )
-            draw.text((badge_x1 + pad_x, badge_y1 + pad_y), badge_text, font=font_badge, fill=badge_fg)
-
-        rank_y = 132 * SCALE
-        rank_text_x = text_x
-        if rank == 1:
-            star_outer_r = 13 * SCALE
-            star_cx = text_x + star_outer_r
-            star_cy = rank_y + 19 * SCALE
-            draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
-            rank_text_x = text_x + star_outer_r * 2 + 10 * SCALE
-
-        rank_line = f"Rank #{rank} of {total_members}"
-        draw.text((rank_text_x, rank_y), rank_line, font=font_rank, fill=rank_text_rgb)
-
-        if rank_change is not None:
-            badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
-            badge_cy = rank_y + 21 * SCALE
-            if rank_change > 0:
-                draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
-                draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
-            elif rank_change < 0:
-                draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
-                draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
-            else:
-                draw.rounded_rectangle(
-                    [badge_x, badge_cy - 3 * SCALE, badge_x + 18 * SCALE, badge_cy + 3 * SCALE],
-                    radius=3 * SCALE, fill=MUTED_TEXT,
-                )
-
-        stat_y = 205 * SCALE
-        draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
-        draw.text((text_x, stat_y + 32 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
-
-        stat_x2 = text_x + 330 * SCALE
-        draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
-        week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
-        draw.text((stat_x2, stat_y + 32 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
-
-        draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=14 * SCALE, fill=BAR_BG)
-        draw.text(
-            (bar_x, bar_y - 34 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
-            font=font_bar_label, fill=MUTED_TEXT,
-        )
-
-    def render_solid_frame(
-        border_rgb: tuple, tint_background: bool = True, rank_text_override: Optional[tuple] = None,
-    ) -> "Image.Image":
-        """Draws one full card in a single solid color and returns it
-        already downscaled to FINAL_W/FINAL_H. Used for the "solid" mode
-        (once) and "rainbow" mode (once per hue-rotated frame).
-
-        For the animated rainbow path, tint_background=False keeps the
-        background a flat, unchanging dark gray instead of tinting it
-        toward the rotating hue, and rank_text_override holds the rank
-        text at one fixed color instead of shifting every frame — only
-        the border outline, avatar ring, and progress-bar fill actually
-        rotate. This isn't just a style choice: a GIF's whole animation
-        shares one 256-color palette, so the smaller the area that
-        actually changes color frame-to-frame, the more of that budget
-        is available for a smooth hue sweep on the part that matters,
-        instead of it being spent thinly across a full-card gradient and
-        showing up as visible banding."""
-        rank_text_rgb = rank_text_override if rank_text_override is not None else (
-            GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
-        )
-
-        if tint_background:
-            tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
-            bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
-            bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
-            bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+    # Everything below is CPU-bound PIL work (drawing, resizing, GIF
+    # encoding) with no more awaits — left as a plain synchronous
+    # function and run in a thread pool executor rather than inline.
+    # Without this, rendering an animated rainbow card (which takes
+    # several real seconds) would block the bot's entire event loop —
+    # not just this one server, every server the bot is in — for that
+    # whole duration, since asyncio only stops blocking at an actual
+    # await point, and there isn't one anywhere in this rendering code.
+    def _render_sync() -> io.BytesIO:
+        if avatar_bytes is not None:
+            avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
         else:
-            bg_gradient = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
+            avatar_img = Image.new("RGBA", (256, 256), (88, 101, 242, 255))
 
-        card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
-        card.paste(bg_gradient, (0, 0), corner_mask)
-        draw = ImageDraw.Draw(card)
 
-        draw.rounded_rectangle(
-            [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
-            radius=22 * SCALE, outline=border_rgb, width=8 * SCALE,
-        )
-        draw.ellipse(
-            [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
-             avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
-            outline=border_rgb, width=5 * SCALE,
-        )
-        card.paste(avatar_resized, avatar_pos, avatar_mask)
+        avatar_size = 240 * SCALE
+        avatar_pos = (35 * SCALE, (CARD_H - avatar_size) // 2)
+        avatar_resized = avatar_img.resize((avatar_size, avatar_size), Image.LANCZOS)
+        avatar_mask = Image.new("L", (avatar_size, avatar_size), 0)
+        ImageDraw.Draw(avatar_mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
+        ring_pad = 6 * SCALE
 
-        _draw_body(card, draw, rank_text_rgb)
-        if fill_w:
-            draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=border_rgb)
+        corner_mask = Image.new("L", (CARD_W, CARD_H), 0)
+        ImageDraw.Draw(corner_mask).rounded_rectangle([0, 0, CARD_W - 1, CARD_H - 1], radius=24 * SCALE, fill=255)
+        # Left-to-right gradient mask, bright (255) on the left where the
+        # avatar ring sits, fading to dark (0) on the right — reused both for
+        # the subtle single-color background tint (solid/rainbow modes) and
+        # as the blend between color1/color2 (gradient mode).
+        grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
 
-        return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
+        text_x = 35 * SCALE + avatar_size + 45 * SCALE
+        font_name = _find_profile_font(True, 52 * SCALE)
+        font_rank = _find_profile_font(True, 34 * SCALE)
+        font_change = _find_profile_font(True, 24 * SCALE)
+        font_stat_label = _find_profile_font(False, 23 * SCALE)
+        font_stat_value = _find_profile_font(True, 34 * SCALE)
+        font_bar_label = _find_profile_font(False, 23 * SCALE)
+        font_badge = _find_profile_font(True, 20 * SCALE)
 
-    def render_gradient_frame(c1_rgb: tuple, c2_rgb: tuple) -> "Image.Image":
-        """Draws the static two-color "gradient" mode: background, border
-        outline, avatar ring, and progress-bar fill all sweep from c1
-        (left) to c2 (right) using one shared gradient image applied
-        through masks, so every element reads from the exact same blend
-        instead of each being tinted independently."""
-        rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(c1_rgb)
+        _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
-        c1_layer = Image.new("RGBA", (CARD_W, CARD_H), c1_rgb)
-        c2_layer = Image.new("RGBA", (CARD_W, CARD_H), c2_rgb)
-        color_gradient = Image.composite(c1_layer, c2_layer, grad_mask)  # c1 on the left, c2 on the right
+        # A tier badge (drawn below, in _draw_body) sits in the top-right
+        # corner when a banner tier applies — its exact pixel width is
+        # measured here (not guessed) so the name and milestone text reserve
+        # precisely enough room to truncate before running under it, however
+        # long the tier's name actually is, instead of a fixed guess that
+        # only happened to be wide enough for short names like "Elite".
+        badge_reserve = 0
+        if banner is not None and banner.get("name"):
+            badge_text_measured = banner["name"].upper()
+            badge_reserve = _measure_draw.textlength(badge_text_measured, font=font_badge) + 16 * SCALE * 2 + 20 * SCALE
+        max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
+        display_name = _fit_text_to_width(_measure_draw, display_name_raw, font_name, max_name_width)
 
-        tinted_c1 = _tint(BG_COLOR[:3], c1_rgb[:3], 0.13) + (255,)
-        tinted_c2 = _tint(BG_COLOR[:3], c2_rgb[:3], 0.13) + (255,)
-        bg_c1 = Image.new("RGBA", (CARD_W, CARD_H), tinted_c1)
-        bg_c2 = Image.new("RGBA", (CARD_W, CARD_H), tinted_c2)
-        bg_gradient = Image.composite(bg_c1, bg_c2, grad_mask)
+        bar_x, bar_y = text_x, 362 * SCALE
+        bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 28 * SCALE
+        effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
+        pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
+        fill_w = max(int(bar_w * pct), bar_h) if pct > 0 else 0
 
-        card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
-        card.paste(bg_gradient, (0, 0), corner_mask)
-        draw = ImageDraw.Draw(card)
+        def _tint(base_rgb, accent_rgb, ratio):
+            return tuple(int(base_rgb[i] * (1 - ratio) + accent_rgb[i] * ratio) for i in range(3))
 
-        # Outline strokes (card border + avatar ring) painted with the
-        # gradient by drawing them onto a one-off mask, then pasting the
-        # gradient image through that mask — Pillow can't stroke a shape
-        # with a gradient directly.
-        stroke_mask = Image.new("L", (CARD_W, CARD_H), 0)
-        stroke_draw = ImageDraw.Draw(stroke_mask)
-        stroke_draw.rounded_rectangle(
-            [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
-            radius=22 * SCALE, outline=255, width=8 * SCALE,
-        )
-        stroke_draw.ellipse(
-            [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
-             avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
-            outline=255, width=5 * SCALE,
-        )
-        card.paste(color_gradient, (0, 0), stroke_mask)
-        card.paste(avatar_resized, avatar_pos, avatar_mask)
+        def _draw_body(card: "Image.Image", draw: "ImageDraw.ImageDraw", rank_text_rgb: tuple):
+            """Everything that isn't the background/border/bar fill — avatar,
+            name, rank, milestone text, stats, tier badge. Identical across
+            every mode."""
+            draw.text((text_x, 44 * SCALE), display_name, font=font_name, fill=WHITE)
 
-        _draw_body(card, draw, rank_text_rgb)
-        if fill_w:
-            bar_mask = Image.new("L", (CARD_W, CARD_H), 0)
-            ImageDraw.Draw(bar_mask).rounded_rectangle(
-                [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=255,
+            if banner is not None and banner.get("name"):
+                badge_text = banner["name"].upper()
+                badge_bg = _hex_to_rgb(banner["color1"]) + (255,)
+                badge_fg = _contrast_text_color(badge_bg)
+                pad_x, pad_y = 16 * SCALE, 8 * SCALE
+                text_w = draw.textlength(badge_text, font=font_badge)
+                badge_h = 20 * SCALE + pad_y * 2
+                badge_w = text_w + pad_x * 2
+                badge_x2 = CARD_W - 26 * SCALE
+                badge_x1 = badge_x2 - badge_w
+                badge_y1 = 26 * SCALE
+                draw.rounded_rectangle(
+                    [badge_x1, badge_y1, badge_x2, badge_y1 + badge_h], radius=badge_h / 2, fill=badge_bg,
+                )
+                draw.text((badge_x1 + pad_x, badge_y1 + pad_y), badge_text, font=font_badge, fill=badge_fg)
+
+            rank_y = 132 * SCALE
+            rank_text_x = text_x
+            if rank == 1:
+                star_outer_r = 13 * SCALE
+                star_cx = text_x + star_outer_r
+                star_cy = rank_y + 19 * SCALE
+                draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
+                rank_text_x = text_x + star_outer_r * 2 + 10 * SCALE
+
+            rank_line = f"Rank #{rank} of {total_members}"
+            draw.text((rank_text_x, rank_y), rank_line, font=font_rank, fill=rank_text_rgb)
+
+            if rank_change is not None:
+                badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
+                badge_cy = rank_y + 21 * SCALE
+                if rank_change > 0:
+                    draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
+                    draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
+                elif rank_change < 0:
+                    draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
+                    draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
+                else:
+                    draw.rounded_rectangle(
+                        [badge_x, badge_cy - 3 * SCALE, badge_x + 18 * SCALE, badge_cy + 3 * SCALE],
+                        radius=3 * SCALE, fill=MUTED_TEXT,
+                    )
+
+            stat_y = 205 * SCALE
+            draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
+            draw.text((text_x, stat_y + 32 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
+
+            stat_x2 = text_x + 330 * SCALE
+            draw.text((stat_x2, stat_y), "THIS WEEK", font=font_stat_label, fill=MUTED_TEXT)
+            week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
+            draw.text((stat_x2, stat_y + 32 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
+
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=14 * SCALE, fill=BAR_BG)
+            draw.text(
+                (bar_x, bar_y - 34 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
+                font=font_bar_label, fill=MUTED_TEXT,
             )
-            card.paste(color_gradient, (0, 0), bar_mask)
 
-        return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)
+        def render_solid_frame(
+            border_rgb: tuple, tint_background: bool = True, rank_text_override: Optional[tuple] = None,
+        ) -> "Image.Image":
+            """Draws one full card in a single solid color and returns it
+            already downscaled to FINAL_W/FINAL_H. Used for the "solid" mode
+            (once) and "rainbow" mode (once per hue-rotated frame).
 
-    buf = io.BytesIO()
+            For the animated rainbow path, tint_background=False keeps the
+            background a flat, unchanging dark gray instead of tinting it
+            toward the rotating hue, and rank_text_override holds the rank
+            text at one fixed color instead of shifting every frame — only
+            the border outline, avatar ring, and progress-bar fill actually
+            rotate. This isn't just a style choice: a GIF's whole animation
+            shares one 256-color palette, so the smaller the area that
+            actually changes color frame-to-frame, the more of that budget
+            is available for a smooth hue sweep on the part that matters,
+            instead of it being spent thinly across a full-card gradient and
+            showing up as visible banding."""
+            rank_text_rgb = rank_text_override if rank_text_override is not None else (
+                GOLD_ACCENT if rank == 1 else _readable_text_variant(border_rgb)
+            )
 
-    # PNG supports real alpha, so the rounded-rect corner_mask clip (which
-    # leaves fully transparent pixels outside the card's rounded corners)
-    # comes through correctly as-is — no flattening needed. Converting to
-    # RGB here would have dropped alpha and left those corners as solid
-    # black squares instead of see-through rounded corners.
-    if mode == "gradient" and color2_rgb is not None:
-        frame = render_gradient_frame(color1_rgb, color2_rgb)
-        frame.save(buf, format="PNG")
-        buf.seek(0)
-        return buf
+            if tint_background:
+                tinted_bg = _tint(BG_COLOR[:3], border_rgb[:3], 0.13) + (255,)
+                bg_plain = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
+                bg_tinted = Image.new("RGBA", (CARD_W, CARD_H), tinted_bg)
+                bg_gradient = Image.composite(bg_tinted, bg_plain, grad_mask)
+            else:
+                bg_gradient = Image.new("RGBA", (CARD_W, CARD_H), BG_COLOR)
 
-    if mode != "rainbow":
-        frame = render_solid_frame(color1_rgb)
-        frame.save(buf, format="PNG")
-        buf.seek(0)
-        return buf
+            card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+            card.paste(bg_gradient, (0, 0), corner_mask)
+            draw = ImageDraw.Draw(card)
 
-    fixed_rank_text = GOLD_ACCENT if rank == 1 else _readable_text_variant(color1_rgb)
-    frames_rgba = [
-        render_solid_frame(
-            _rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES)),
-            tint_background=False, rank_text_override=fixed_rank_text,
+            draw.rounded_rectangle(
+                [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
+                radius=22 * SCALE, outline=border_rgb, width=8 * SCALE,
+            )
+            draw.ellipse(
+                [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
+                 avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
+                outline=border_rgb, width=5 * SCALE,
+            )
+            card.paste(avatar_resized, avatar_pos, avatar_mask)
+
+            _draw_body(card, draw, rank_text_rgb)
+            if fill_w:
+                draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=border_rgb)
+
+            return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
+
+        def render_gradient_frame(c1_rgb: tuple, c2_rgb: tuple) -> "Image.Image":
+            """Draws the static two-color "gradient" mode: background, border
+            outline, avatar ring, and progress-bar fill all sweep from c1
+            (left) to c2 (right) using one shared gradient image applied
+            through masks, so every element reads from the exact same blend
+            instead of each being tinted independently."""
+            rank_text_rgb = GOLD_ACCENT if rank == 1 else _readable_text_variant(c1_rgb)
+
+            c1_layer = Image.new("RGBA", (CARD_W, CARD_H), c1_rgb)
+            c2_layer = Image.new("RGBA", (CARD_W, CARD_H), c2_rgb)
+            color_gradient = Image.composite(c1_layer, c2_layer, grad_mask)  # c1 on the left, c2 on the right
+
+            tinted_c1 = _tint(BG_COLOR[:3], c1_rgb[:3], 0.13) + (255,)
+            tinted_c2 = _tint(BG_COLOR[:3], c2_rgb[:3], 0.13) + (255,)
+            bg_c1 = Image.new("RGBA", (CARD_W, CARD_H), tinted_c1)
+            bg_c2 = Image.new("RGBA", (CARD_W, CARD_H), tinted_c2)
+            bg_gradient = Image.composite(bg_c1, bg_c2, grad_mask)
+
+            card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+            card.paste(bg_gradient, (0, 0), corner_mask)
+            draw = ImageDraw.Draw(card)
+
+            # Outline strokes (card border + avatar ring) painted with the
+            # gradient by drawing them onto a one-off mask, then pasting the
+            # gradient image through that mask — Pillow can't stroke a shape
+            # with a gradient directly.
+            stroke_mask = Image.new("L", (CARD_W, CARD_H), 0)
+            stroke_draw = ImageDraw.Draw(stroke_mask)
+            stroke_draw.rounded_rectangle(
+                [4 * SCALE, 4 * SCALE, CARD_W - 5 * SCALE, CARD_H - 5 * SCALE],
+                radius=22 * SCALE, outline=255, width=8 * SCALE,
+            )
+            stroke_draw.ellipse(
+                [avatar_pos[0] - ring_pad, avatar_pos[1] - ring_pad,
+                 avatar_pos[0] + avatar_size + ring_pad, avatar_pos[1] + avatar_size + ring_pad],
+                outline=255, width=5 * SCALE,
+            )
+            card.paste(color_gradient, (0, 0), stroke_mask)
+            card.paste(avatar_resized, avatar_pos, avatar_mask)
+
+            _draw_body(card, draw, rank_text_rgb)
+            if fill_w:
+                bar_mask = Image.new("L", (CARD_W, CARD_H), 0)
+                ImageDraw.Draw(bar_mask).rounded_rectangle(
+                    [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=255,
+                )
+                card.paste(color_gradient, (0, 0), bar_mask)
+
+            return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)
+
+        buf = io.BytesIO()
+
+        # PNG supports real alpha, so the rounded-rect corner_mask clip (which
+        # leaves fully transparent pixels outside the card's rounded corners)
+        # comes through correctly as-is — no flattening needed. Converting to
+        # RGB here would have dropped alpha and left those corners as solid
+        # black squares instead of see-through rounded corners.
+        if mode == "gradient" and color2_rgb is not None:
+            frame = render_gradient_frame(color1_rgb, color2_rgb)
+            frame.save(buf, format="PNG")
+            buf.seek(0)
+            return buf
+
+        if mode != "rainbow":
+            frame = render_solid_frame(color1_rgb)
+            frame.save(buf, format="PNG")
+            buf.seek(0)
+            return buf
+
+        fixed_rank_text = GOLD_ACCENT if rank == 1 else _readable_text_variant(color1_rgb)
+        frames_rgba = [
+            render_solid_frame(
+                _rotate_hue(color1_rgb, i * (360.0 / ANIMATED_PROFILE_FRAMES)),
+                tint_background=False, rank_text_override=fixed_rank_text,
+            )
+            for i in range(ANIMATED_PROFILE_FRAMES)
+        ]
+
+        # GIF has no real alpha channel — only one palette color can be marked
+        # "transparent" per frame. Plainly converting the RGBA frames above to
+        # RGB would turn the rounded corners (currently fully transparent, alpha
+        # 0) into solid black squares, since dropping alpha just keeps the
+        # underlying R/G/B values as-is. Instead, every pixel below the alpha
+        # threshold gets overwritten with one reserved sentinel color first —
+        # chosen to be nothing else in the card ever produces — so it survives
+        # quantization as its own palette entry, and that entry is then marked
+        # as the transparent index when saving. This does mean the rounded
+        # corner's edge is a hard cutoff rather than smoothly anti-aliased
+        # (GIF transparency is binary, on or off) — some jaggedness right at
+        # the curve is an inherent GIF limitation, not a bug, but it's only a
+        # couple of pixels wide thanks to the supersampled render.
+        CORNER_KEY_RGB = (1, 2, 3)
+
+        def _flatten_with_transparency_key(rgba_frame: "Image.Image") -> "Image.Image":
+            alpha = rgba_frame.split()[3]
+            rgb = rgba_frame.convert("RGB")
+            transparent_mask = alpha.point(lambda a: 255 if a < 128 else 0)
+            rgb.paste(Image.new("RGB", rgba_frame.size, CORNER_KEY_RGB), mask=transparent_mask)
+            return rgb
+
+        frames = [_flatten_with_transparency_key(f) for f in frames_rgba]
+
+        # GIF frames all need to share one 256-color palette — quantizing each
+        # frame independently would let every frame pick slightly different
+        # colors and flicker. The palette is built from every frame (not just
+        # a handful) so it actually covers the full hue rotation rather than
+        # banding on frames that weren't sampled, and dithering is turned OFF:
+        # Floyd-Steinberg dithering is randomized per frame, so on an
+        # animation it doesn't look like smooth shading — it looks like
+        # static/noise crawling over the card as frames change. A flat
+        # nearest-color match keeps every frame visually stable; the palette
+        # being well-covered is what keeps that from banding badly. Each frame
+        # contributes a small thumbnail rather than its full-resolution self —
+        # same color distribution for palette purposes, far less work.
+        thumb_w, thumb_h = 160, int(160 * frames[0].height / frames[0].width)
+        strip = Image.new("RGB", (thumb_w * len(frames), thumb_h))
+        for i, frame in enumerate(frames):
+            strip.paste(frame.resize((thumb_w, thumb_h), Image.BILINEAR), (i * thumb_w, 0))
+        shared_palette = strip.quantize(colors=256, method=Image.MEDIANCUT)
+
+        # Whichever palette index the sentinel color landed on is what gets
+        # marked transparent — found by running it through the same palette
+        # rather than assumed, since MEDIANCUT's exact index assignment isn't
+        # something to hardcode.
+        key_probe = Image.new("RGB", (1, 1), CORNER_KEY_RGB).quantize(palette=shared_palette, dither=Image.NONE)
+        transparent_index = key_probe.getpixel((0, 0))
+
+        quantized = [f.quantize(palette=shared_palette, dither=Image.NONE) for f in frames]
+        quantized[0].save(
+            buf, format="GIF", save_all=True, append_images=quantized[1:],
+            duration=ANIMATED_PROFILE_FRAME_MS, loop=0, disposal=2, transparency=transparent_index,
         )
-        for i in range(ANIMATED_PROFILE_FRAMES)
-    ]
+        buf.seek(0)
+        return buf
 
-    # GIF has no real alpha channel — only one palette color can be marked
-    # "transparent" per frame. Plainly converting the RGBA frames above to
-    # RGB would turn the rounded corners (currently fully transparent, alpha
-    # 0) into solid black squares, since dropping alpha just keeps the
-    # underlying R/G/B values as-is. Instead, every pixel below the alpha
-    # threshold gets overwritten with one reserved sentinel color first —
-    # chosen to be nothing else in the card ever produces — so it survives
-    # quantization as its own palette entry, and that entry is then marked
-    # as the transparent index when saving. This does mean the rounded
-    # corner's edge is a hard cutoff rather than smoothly anti-aliased
-    # (GIF transparency is binary, on or off) — some jaggedness right at
-    # the curve is an inherent GIF limitation, not a bug, but it's only a
-    # couple of pixels wide thanks to the supersampled render.
-    CORNER_KEY_RGB = (1, 2, 3)
-
-    def _flatten_with_transparency_key(rgba_frame: "Image.Image") -> "Image.Image":
-        alpha = rgba_frame.split()[3]
-        rgb = rgba_frame.convert("RGB")
-        transparent_mask = alpha.point(lambda a: 255 if a < 128 else 0)
-        rgb.paste(Image.new("RGB", rgba_frame.size, CORNER_KEY_RGB), mask=transparent_mask)
-        return rgb
-
-    frames = [_flatten_with_transparency_key(f) for f in frames_rgba]
-
-    # GIF frames all need to share one 256-color palette — quantizing each
-    # frame independently would let every frame pick slightly different
-    # colors and flicker. The palette is built from every frame (not just
-    # a handful) so it actually covers the full hue rotation rather than
-    # banding on frames that weren't sampled, and dithering is turned OFF:
-    # Floyd-Steinberg dithering is randomized per frame, so on an
-    # animation it doesn't look like smooth shading — it looks like
-    # static/noise crawling over the card as frames change. A flat
-    # nearest-color match keeps every frame visually stable; the palette
-    # being well-covered is what keeps that from banding badly. Each frame
-    # contributes a small thumbnail rather than its full-resolution self —
-    # same color distribution for palette purposes, far less work.
-    thumb_w, thumb_h = 160, int(160 * frames[0].height / frames[0].width)
-    strip = Image.new("RGB", (thumb_w * len(frames), thumb_h))
-    for i, frame in enumerate(frames):
-        strip.paste(frame.resize((thumb_w, thumb_h), Image.BILINEAR), (i * thumb_w, 0))
-    shared_palette = strip.quantize(colors=256, method=Image.MEDIANCUT)
-
-    # Whichever palette index the sentinel color landed on is what gets
-    # marked transparent — found by running it through the same palette
-    # rather than assumed, since MEDIANCUT's exact index assignment isn't
-    # something to hardcode.
-    key_probe = Image.new("RGB", (1, 1), CORNER_KEY_RGB).quantize(palette=shared_palette, dither=Image.NONE)
-    transparent_index = key_probe.getpixel((0, 0))
-
-    quantized = [f.quantize(palette=shared_palette, dither=Image.NONE) for f in frames]
-    quantized[0].save(
-        buf, format="GIF", save_all=True, append_images=quantized[1:],
-        duration=ANIMATED_PROFILE_FRAME_MS, loop=0, disposal=2, transparency=transparent_index,
-    )
-    buf.seek(0)
-    return buf
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _render_sync)
 
 # ---------------------------------------------------------------------------
 # Interactive settings panel (buttons, modals, select menus)
@@ -1938,11 +1975,24 @@ class ConfirmRemoveAllView(discord.ui.View):
     """Two-step confirmation for wiping every tracked user in a server —
     destructive and irreversible, so it never fires on a single click."""
 
-    def __init__(self, guild_id: int, user_count: int):
+    def __init__(self, guild_id: int, user_count: int, invoker_id: int):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         self.user_count = user_count
+        self.invoker_id = invoker_id
         self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Discord doesn't restrict who can click a component to whoever
+        # triggered the original command — without this check, anyone who
+        # can see this message (it isn't always ephemeral) could click
+        # Confirm themselves, regardless of their own permissions.
+        if interaction.user.id == self.invoker_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who ran this command can respond to this confirmation.", ephemeral=True
+        )
+        return False
 
     @discord.ui.button(label="Confirm — Delete Everyone", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1982,11 +2032,20 @@ class ConfirmRemoveStaleView(discord.ui.View):
     """Two-step confirmation for wiping tracking data belonging to users
     who are no longer in the server."""
 
-    def __init__(self, guild_id: int, stale_uids: list):
+    def __init__(self, guild_id: int, stale_uids: list, invoker_id: int):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         self.stale_uids = stale_uids
+        self.invoker_id = invoker_id
         self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.invoker_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who ran this command can respond to this confirmation.", ephemeral=True
+        )
+        return False
 
     @discord.ui.button(label="Confirm — Remove Departed Members", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2029,10 +2088,19 @@ class ConfirmUndoImportView(discord.ui.View):
     """Two-step confirmation for reverting an entire /importxp batch back
     to how things were right before it ran."""
 
-    def __init__(self, guild_id: int):
+    def __init__(self, guild_id: int, invoker_id: int):
         super().__init__(timeout=60)
         self.guild_id = guild_id
+        self.invoker_id = invoker_id
         self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.invoker_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who ran this command can respond to this confirmation.", ephemeral=True
+        )
+        return False
 
     @discord.ui.button(label="Confirm — Undo Import", style=discord.ButtonStyle.danger, emoji="↩️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2075,11 +2143,20 @@ class ConfirmRestoreView(discord.ui.View):
     """Two-step confirmation for restoring a full /backup — replaces
     EVERY setting and every tracked user's data for this server."""
 
-    def __init__(self, guild_id: int, restored_guild_data: dict):
+    def __init__(self, guild_id: int, restored_guild_data: dict, invoker_id: int):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         self.restored_guild_data = restored_guild_data
+        self.invoker_id = invoker_id
         self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.invoker_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who ran this command can respond to this confirmation.", ephemeral=True
+        )
+        return False
 
     @discord.ui.button(label="Confirm — Restore Backup", style=discord.ButtonStyle.danger, emoji="♻️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2952,7 +3029,7 @@ class DangerZoneSettingsView(discord.ui.View):
         if count == 0:
             await interaction.response.send_message("No one is being tracked yet — nothing to remove.", ephemeral=True)
             return
-        view = ConfirmRemoveAllView(self.guild_id, count)
+        view = ConfirmRemoveAllView(self.guild_id, count, interaction.user.id)
         await interaction.response.send_message(
             f"⚠️ This will permanently delete tracking data for **all {count} tracked user(s)** "
             f"in this server. This can't be undone. Continue?",
@@ -2975,7 +3052,7 @@ class DangerZoneSettingsView(discord.ui.View):
         if not stale_uids:
             await interaction.followup.send("No stale entries found — everyone tracked is still in the server.", ephemeral=True)
             return
-        view = ConfirmRemoveStaleView(self.guild_id, stale_uids)
+        view = ConfirmRemoveStaleView(self.guild_id, stale_uids, interaction.user.id)
         await interaction.followup.send(
             f"⚠️ Found **{len(stale_uids)}** tracked user(s) no longer in this server. Continue?",
             view=view,
@@ -4499,6 +4576,14 @@ async def backup_cmd(interaction: discord.Interaction):
 async def restore_cmd(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(thinking=True, ephemeral=True)
 
+    MAX_RESTORE_FILE_BYTES = 25 * 1024 * 1024  # 25MB — a real /backup of even a huge server won't approach this
+    if file.size and file.size > MAX_RESTORE_FILE_BYTES:
+        await interaction.followup.send(
+            f"That file is too large ({file.size / 1024 / 1024:.1f}MB) to be a genuine `/backup` export — refusing to parse it.",
+            ephemeral=True,
+        )
+        return
+
     try:
         raw = await file.read()
         payload = json.loads(raw.decode("utf-8"))
@@ -4527,7 +4612,7 @@ async def restore_cmd(interaction: discord.Interaction, file: discord.Attachment
     except (TypeError, ValueError):
         time_str = "at an unknown time"
 
-    view = ConfirmRestoreView(interaction.guild_id, restored_guild_data)
+    view = ConfirmRestoreView(interaction.guild_id, restored_guild_data, interaction.user.id)
     await interaction.followup.send(
         f"⚠️ This will **completely replace** all settings and tracked data for this server with "
         f"a backup taken {time_str} (**{user_count}** tracked user(s) in that backup). Everything "
@@ -4566,7 +4651,7 @@ async def exportdata(interaction: discord.Interaction, file_format: app_commands
     ]
     for uid, entry in guild_data["users"].items():
         member = interaction.guild.get_member(int(uid))
-        username = member.name if member else ""
+        username = _csv_safe(member.name) if member else ""
         baseline_xp, _ = get_baseline(entry)
         last_checkin = entry["checkins"][-1]["time"] if entry["checkins"] else ""
         rows.append([
@@ -4654,6 +4739,21 @@ async def importxp(
             await guild.chunk()
         except discord.ClientException:
             pass  # members intent not enabled — matching will fall back to whatever's cached
+
+    # A legitimate member roster has no business being this large — reject
+    # before parsing rather than after, since openpyxl loads the whole
+    # workbook into memory and a compressed .xlsx can expand well beyond
+    # its upload size (zip-bomb-style), and this command is otherwise
+    # trusted-admin-only rather than sandboxed against a hostile file.
+    MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024  # 10MB
+    if file.size and file.size > MAX_IMPORT_FILE_BYTES:
+        await interaction.followup.send(
+            f"That file is too large ({file.size / 1024 / 1024:.1f}MB) — imports are capped at "
+            f"{MAX_IMPORT_FILE_BYTES / 1024 / 1024:.0f}MB. If this is a genuine roster that size, split it into "
+            f"multiple smaller files and import them one at a time.",
+            ephemeral=True,
+        )
+        return
 
     try:
         raw = await file.read()
@@ -4804,7 +4904,7 @@ async def undoimport(interaction: discord.Interaction):
     after_count = len(guild_data["users"])
     snapshot_time = int(parse_iso(snapshot["time"]).timestamp())
 
-    view = ConfirmUndoImportView(interaction.guild_id)
+    view = ConfirmUndoImportView(interaction.guild_id, interaction.user.id)
     await interaction.response.send_message(
         f"⚠️ This will revert **everyone's** tracking data back to how it looked "
         f"<t:{snapshot_time}:R>, right before that import ran (currently **{after_count}** "
@@ -5518,7 +5618,7 @@ async def removeallusers(interaction: discord.Interaction):
         await interaction.response.send_message("No one is being tracked yet — nothing to remove.", ephemeral=True)
         return
 
-    view = ConfirmRemoveAllView(interaction.guild_id, count)
+    view = ConfirmRemoveAllView(interaction.guild_id, count, interaction.user.id)
     await interaction.response.send_message(
         f"⚠️ This will permanently delete tracking data for **all {count} tracked user(s)** "
         f"in this server — weekly progress, all-time totals, and checkin history. This can't be undone. Continue?",
@@ -5591,7 +5691,7 @@ async def removestaleusers(interaction: discord.Interaction):
         await interaction.followup.send("No stale entries found — everyone tracked is still in the server.", ephemeral=True)
         return
 
-    view = ConfirmRemoveStaleView(interaction.guild_id, stale_uids)
+    view = ConfirmRemoveStaleView(interaction.guild_id, stale_uids, interaction.user.id)
     await interaction.followup.send(
         f"⚠️ Found **{len(stale_uids)}** tracked user(s) no longer in this server. "
         f"This will permanently delete their tracking data. Continue?",
