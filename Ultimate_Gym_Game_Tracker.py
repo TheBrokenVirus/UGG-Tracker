@@ -1580,15 +1580,15 @@ async def build_profile_card(
         grad_mask = ImageOps.invert(Image.linear_gradient("L").rotate(90, expand=True)).resize((CARD_W, CARD_H))
 
         text_x = 35 * SCALE + avatar_size + 45 * SCALE
-        NAME_BASE_SIZE = 52 * SCALE
-        NAME_MIN_SIZE = 32 * SCALE  # floor before it starts truncating instead of shrinking further
-        font_rank = _find_profile_font(True, 34 * SCALE)
+        NAME_BASE_SIZE = 58 * SCALE
+        NAME_MIN_SIZE = 36 * SCALE  # floor before it starts truncating instead of shrinking further
+        font_rank = _find_profile_font(True, 42 * SCALE)
         font_change = _find_profile_font(True, 22 * SCALE)
         font_stat_label = _find_profile_font(False, 23 * SCALE)
         font_stat_value = _find_profile_font(True, 34 * SCALE)
-        font_bar_label = _find_profile_font(True, 18 * SCALE)
+        font_bar_label = _find_profile_font(True, 22 * SCALE)
         font_badge = _find_profile_font(True, 27 * SCALE)
-        font_chip = _find_profile_font(True, 22 * SCALE)
+        font_chip = _find_profile_font(True, 27 * SCALE)
         font_lift_label = _find_profile_font(False, 28 * SCALE)
         font_lift_value = _find_profile_font(True, 28 * SCALE)
         font_pct = _find_profile_font(True, 19 * SCALE)
@@ -1695,7 +1695,7 @@ async def build_profile_card(
                 draw.rounded_rectangle(
                     [badge_x1, badge_y1, badge_x2, badge_y1 + badge_h], radius=badge_h / 2, fill=badge_bg,
                 )
-                draw.text((badge_x1 + pad_x, badge_y1 + pad_y), badge_text, font=font_badge, fill=badge_fg)
+                _centered_text(draw, badge_x1 + badge_w / 2, badge_y1 + badge_h / 2, badge_text, font_badge, badge_fg)
                 badge_bottom = badge_y1 + badge_h
 
             if show_lifts:
@@ -1713,7 +1713,7 @@ async def build_profile_card(
             rank_y = 132 * SCALE
             rank_text_x = text_x
             if rank == 1:
-                star_outer_r = 13 * SCALE
+                star_outer_r = 16 * SCALE
                 star_cx = text_x + star_outer_r
                 star_cy = rank_y + 19 * SCALE
                 draw.polygon(_star_points(star_cx, star_cy, star_outer_r, star_outer_r * 0.45), fill=GOLD_ACCENT)
@@ -1756,7 +1756,7 @@ async def build_profile_card(
 
             if personal_bests and personal_bests.get("best_day_xp"):
                 chip_y = 182 * SCALE
-                _pill(draw, text_x, chip_y, f"Best Day {personal_bests['best_day_xp']:,} XP", font_chip, BAR_BG, WHITE, h=38 * SCALE)
+                _pill(draw, text_x, chip_y, f"Best Day {personal_bests['best_day_xp']:,} XP", font_chip, BAR_BG, WHITE)
 
             stat_y = 250 * SCALE
             draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
@@ -1767,15 +1767,17 @@ async def build_profile_card(
             week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
             draw.text((stat_x2, stat_y + 32 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
 
-            label_y = bar_y - 38 * SCALE
+            label_y = bar_y - 40 * SCALE
             draw.text((bar_x, label_y), "WEEKLY PROGRESS", font=font_bar_label, fill=MUTED_TEXT)
+            label_bbox = draw.textbbox((bar_x, label_y), "WEEKLY PROGRESS", font=font_bar_label)
+            label_center_y = (label_bbox[1] + label_bbox[3]) / 2
             # 7-day activity dots, right-aligned on the same row as the
             # label — see get_week_activity_days. Filled = checked in that
             # day, outlined = didn't, relative to this member's own rolling
             # tracking week (not necessarily a calendar Monday).
             dot_r, dot_gap = 8 * SCALE, 10 * SCALE
             dots_w = 7 * (dot_r * 2) + 6 * dot_gap
-            dcx, dcy = bar_x + bar_w - dots_w, label_y + 9 * SCALE
+            dcx, dcy = bar_x + bar_w - dots_w, label_center_y - dot_r
             for checked in activity_days:
                 if checked:
                     draw.ellipse([dcx, dcy, dcx + dot_r * 2, dcy + dot_r * 2], fill=MUTED_TEXT)
