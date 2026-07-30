@@ -4593,7 +4593,7 @@ async def setcrewlevelformula(interaction: discord.Interaction, base_xp: int, gr
 
 @bot.tree.command(
     name="setbasecard",
-    description="[Admin] Set the server's default /profile card color/gradient for members with no tier or custom color",
+    description="[Admin] Set the server's default /profile look for members with no tier or custom color",
 )
 @app_commands.describe(
     mode="solid = one color, gradient = two-color sweep",
@@ -4929,7 +4929,7 @@ async def undo(interaction: discord.Interaction, user: Optional[discord.Member] 
 
 @bot.tree.command(
     name="hide",
-    description="[Admin] Opt a member out of /weeklyleaderboard and /totalleaderboard — still tracked and counted, just not listed",
+    description="[Admin] Hide/unhide a member on leaderboards — still fully tracked and counted",
 )
 @app_commands.describe(
     user="Member to hide or unhide",
