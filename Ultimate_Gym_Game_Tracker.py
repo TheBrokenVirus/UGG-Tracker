@@ -177,6 +177,9 @@ def default_guild_data() -> dict:
         "banked_removed_gained": 0,
         "crew_xp_adjustment": 0,
         "max_checkin_xp_per_hour": None,
+        "default_card_mode": "solid",
+        "default_card_color1": None,
+        "default_card_color2": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -662,6 +665,41 @@ def get_max_checkin_rate(guild_data: dict) -> Optional[float]:
     can imply before it's rejected outright (see /setxpratecap). None
     means no cap configured."""
     return guild_data.get("max_checkin_xp_per_hour")
+
+def get_week_activity_days(entry: dict) -> list:
+    """Returns 7 booleans for the CURRENT tracking week (see
+    week_start_time), True where at least one checkin happened that
+    calendar day. Day 0 is the day the week started, not necessarily a
+    calendar Monday — this bot's "week" is a rolling per-member anchor,
+    not a fixed calendar week, so the dots reflect that same window
+    rather than a Mon-Sun grid that wouldn't line up with it. Purely
+    derived from existing checkin timestamps — nothing new is stored."""
+    week_start = parse_iso(entry["week_start_time"])
+    week_start_date = week_start.date()
+    days = [False] * 7
+    for c in entry.get("checkins", []):
+        t = parse_iso(c["time"])
+        if t < week_start:
+            continue
+        day_index = (t.date() - week_start_date).days
+        if 0 <= day_index < 7:
+            days[day_index] = True
+    return days
+
+def get_lifts(entry: dict) -> dict:
+    """Backward-compatible getter — the three lift badges shown as
+    placeholders on the redesigned /profile card mockups. None means not
+    set yet. Set with /setlift."""
+    lifts = entry.get("lifts", {})
+    return {"deadlift": lifts.get("deadlift"), "bench": lifts.get("bench"), "squat": lifts.get("squat")}
+
+def is_hidden_from_leaderboard(entry: dict) -> bool:
+    """Backward-compatible getter — see /hide. Only affects
+    /weeklyleaderboard and /totalleaderboard; someone hidden this way is
+    still fully counted in /crewtotals, /crewlevel, and their own
+    /status and /profile — hiding is about not being LISTED, not about
+    opting out of being tracked."""
+    return entry.get("hidden_from_leaderboard", False)
 
 def get_personal_bests(entry: dict) -> dict:
     """Backward-compatible getter — entries created before this feature
@@ -1300,6 +1338,21 @@ def get_border_color(entry: dict) -> str:
     won't have a border_color key."""
     return entry.get("border_color", DEFAULT_BORDER_COLOR)
 
+def get_default_card_look(guild_data: dict) -> dict:
+    """Backward-compatible getter — the server-wide default /profile card
+    look (see /setbasecard) for members with no banner tier and no
+    individually-set border color. Falls back to solid Slate if never
+    configured. Returned as a banner-shaped dict with "name": None, so it
+    flows through the exact same solid/gradient rendering as a real
+    banner tier (see _render_member_profile) without build_profile_card
+    needing any special-casing — name=None just means no badge is drawn."""
+    return {
+        "mode": guild_data.get("default_card_mode", "solid"),
+        "color1": guild_data.get("default_card_color1") or DEFAULT_BORDER_COLOR,
+        "color2": guild_data.get("default_card_color2"),
+        "name": None,
+    }
+
 def get_animated_profiles_enabled(guild_data: dict) -> bool:
     """Backward-compatible getter — defaults to True. Admins can opt out
     with /toggleanimatedprofile (static PNG instead of an animated GIF) for
@@ -1391,7 +1444,7 @@ STATIC_PROFILE_SCALE = 5
 async def build_profile_card(
     member: discord.abc.User, entry: dict, stats: dict, requirement: int, rank: int, total_members: int,
     rank_change: Optional[int] = None, banner: Optional[dict] = None, animation_allowed: bool = True,
-    personal_bests: Optional[dict] = None,
+    personal_bests: Optional[dict] = None, lifts: Optional[dict] = None,
 ) -> Optional[io.BytesIO]:
     """Renders a profile card: avatar with a colored ring, name, rank
     (with a daily rank-change indicator), Crew XP, this week's gain, and a
@@ -1401,10 +1454,14 @@ async def build_profile_card(
     rank_change, if given, is
     current-vs-yesterday's-snapshot rank movement (positive = moved up).
 
-    personal_bests, if given (see get_personal_bests), shows a small
-    "🏆 Best Day X · Best Week Y" line between the rank and the stats —
-    only rendered when there's at least one non-zero record, so a
-    brand-new member's card doesn't show a row of zeroes.
+    personal_bests, if given (see get_personal_bests), shows two small
+    "Best Day X" / "Best Week Y" pill chips under the rank line — only
+    rendered when there's at least one non-zero record.
+
+    lifts, if given (see get_lifts), shows small DL/BP/SQ badges stacked
+    under the tier badge (or in its place if there's no tier) — only
+    rendered when at least one lift has actually been set with /setlift,
+    so members not using that feature don't get a permanent row of dashes.
 
     The look of the border/background comes from `banner`, the member's
     resolved banner tier (see get_member_banner_tier) — a dict with
@@ -1451,9 +1508,9 @@ async def build_profile_card(
     if mode == "rainbow" and not animation_allowed:
         mode = "solid"  # accessibility/bandwidth override — see docstring
 
-    FINAL_W, FINAL_H = 1560, 630
+    FINAL_W, FINAL_H = 1560, 675
     SCALE = ANIMATED_PROFILE_SCALE if mode == "rainbow" else STATIC_PROFILE_SCALE
-    CARD_W, CARD_H = 1040 * SCALE, 420 * SCALE
+    CARD_W, CARD_H = 1040 * SCALE, 450 * SCALE
     BG_COLOR = (35, 39, 42, 255)
     MUTED_TEXT = (170, 175, 182, 255)
     WHITE = (245, 246, 248, 255)
@@ -1505,24 +1562,33 @@ async def build_profile_card(
         NAME_BASE_SIZE = 52 * SCALE
         NAME_MIN_SIZE = 32 * SCALE  # floor before it starts truncating instead of shrinking further
         font_rank = _find_profile_font(True, 34 * SCALE)
-        font_change = _find_profile_font(True, 24 * SCALE)
+        font_change = _find_profile_font(True, 22 * SCALE)
         font_stat_label = _find_profile_font(False, 23 * SCALE)
         font_stat_value = _find_profile_font(True, 34 * SCALE)
-        font_bar_label = _find_profile_font(False, 23 * SCALE)
+        font_bar_label = _find_profile_font(True, 18 * SCALE)
         font_badge = _find_profile_font(True, 20 * SCALE)
+        font_chip = _find_profile_font(True, 17 * SCALE)
+        font_lift = _find_profile_font(True, 16 * SCALE)
+        font_pct = _find_profile_font(True, 19 * SCALE)
 
         _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
-        # A tier badge (drawn below, in _draw_body) sits in the top-right
-        # corner when a banner tier applies — its exact pixel width is
-        # measured here (not guessed) so the name and milestone text reserve
-        # precisely enough room to truncate before running under it, however
-        # long the tier's name actually is, instead of a fixed guess that
-        # only happened to be wide enough for short names like "Elite".
+        # A tier badge and/or a lift-badge row (both drawn in _draw_body)
+        # can sit in the top-right corner — their combined width is
+        # measured here (not guessed) so the name reserves precisely
+        # enough room to truncate before running under either one,
+        # whichever is wider, instead of a fixed guess.
+        LIFT_CHIP_W, LIFT_CHIP_GAP = 78 * SCALE, 8 * SCALE
+        show_lifts = bool(lifts) and any(lifts.get(k) is not None for k in ("deadlift", "bench", "squat"))
+        lifts_row_w = 3 * LIFT_CHIP_W + 2 * LIFT_CHIP_GAP if show_lifts else 0
+
         badge_reserve = 0
         if banner is not None and banner.get("name"):
             badge_text_measured = banner["name"].upper()
-            badge_reserve = _measure_draw.textlength(badge_text_measured, font=font_badge) + 16 * SCALE * 2 + 20 * SCALE
+            badge_w_measured = _measure_draw.textlength(badge_text_measured, font=font_badge) + 16 * SCALE * 2
+            badge_reserve = max(badge_w_measured, lifts_row_w) + 20 * SCALE
+        elif show_lifts:
+            badge_reserve = lifts_row_w + 20 * SCALE
         max_name_width = CARD_W - text_x - 40 * SCALE - badge_reserve
         # Long names shrink to fit in full before ever getting truncated —
         # see _fit_name_to_width. Short names are completely unaffected,
@@ -1532,21 +1598,47 @@ async def build_profile_card(
             _measure_draw, display_name_raw, True, NAME_BASE_SIZE, NAME_MIN_SIZE, max_name_width,
         )
 
-        bar_x, bar_y = text_x, 362 * SCALE
-        bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 28 * SCALE
+        bar_x, bar_y = text_x, 381 * SCALE
+        bar_w, bar_h = CARD_W - text_x - 40 * SCALE, 32 * SCALE
         effective_req = stats["effective_requirement"] if stats["is_prorated"] else requirement
         pct = max(min(stats["gained_this_week"] / effective_req, 1.0), 0.0) if effective_req > 0 else 0.0
         fill_w = max(int(bar_w * pct), bar_h) if pct > 0 else 0
+        activity_days = get_week_activity_days(entry)
 
         def _tint(base_rgb, accent_rgb, ratio):
             return tuple(int(base_rgb[i] * (1 - ratio) + accent_rgb[i] * ratio) for i in range(3))
 
+        def _centered_text(draw, cx, cy, text, font, fill):
+            """Draws text centered on (cx, cy), measuring the actual
+            rendered glyph box instead of guessing a fixed offset — a
+            flat constant doesn't account for real font ascender/descender
+            metrics and drifts out of alignment depending on font/text."""
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text((cx - w / 2 - bbox[0], cy - h / 2 - bbox[1]), text, font=font, fill=fill)
+
+        def _pill(draw, x, y, text, font, fill, text_color, h=None):
+            """A simple rounded-rect label pill — used for the Best Day/
+            Best Week and rank-change chips. Returns the pill's right edge."""
+            tw = draw.textlength(text, font=font)
+            pad = 12 * SCALE
+            h = h or (font.size + 18 * SCALE)
+            w = tw + pad * 2
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, fill=fill)
+            _centered_text(draw, x + w / 2, y + h / 2, text, font, text_color)
+            return x + w
+
         def _draw_body(card: "Image.Image", draw: "ImageDraw.ImageDraw", rank_text_rgb: tuple):
-            """Everything that isn't the background/border/bar fill — avatar,
-            name, rank, milestone text, stats, tier badge. Identical across
-            every mode."""
+            """Everything that isn't the background/border/bar fill —
+            avatar, name, rank, tier badge, lift badges, personal bests,
+            stats, and the weekly progress label/dots. Identical across
+            every mode. The bar fill itself and the percentage text drawn
+            over it are handled by the caller (render_solid_frame /
+            render_gradient_frame), since they need to be layered on top
+            of this, not under it."""
             draw.text((text_x, 44 * SCALE), display_name, font=font_name, fill=WHITE)
 
+            badge_bottom = 26 * SCALE  # top offset if nothing is drawn up here
             if banner is not None and banner.get("name"):
                 badge_text = banner["name"].upper()
                 badge_bg = _hex_to_rgb(banner["color1"]) + (255,)
@@ -1562,6 +1654,20 @@ async def build_profile_card(
                     [badge_x1, badge_y1, badge_x2, badge_y1 + badge_h], radius=badge_h / 2, fill=badge_bg,
                 )
                 draw.text((badge_x1 + pad_x, badge_y1 + pad_y), badge_text, font=font_badge, fill=badge_fg)
+                badge_bottom = badge_y1 + badge_h
+
+            if show_lifts:
+                lift_y = badge_bottom + (14 * SCALE if banner is not None and banner.get("name") else 0)
+                lx = CARD_W - 26 * SCALE - lifts_row_w
+                for label, key in (("DL", "deadlift"), ("BP", "bench"), ("SQ", "squat")):
+                    val = lifts.get(key)
+                    txt = f"{label} {val:,}" if val is not None else f"{label} -"
+                    draw.rounded_rectangle(
+                        [lx, lift_y, lx + LIFT_CHIP_W, lift_y + 40 * SCALE], radius=10 * SCALE,
+                        outline=MUTED_TEXT, width=2 * SCALE,
+                    )
+                    _centered_text(draw, lx + LIFT_CHIP_W / 2, lift_y + 20 * SCALE, txt, font_lift, MUTED_TEXT)
+                    lx += LIFT_CHIP_W + LIFT_CHIP_GAP
 
             rank_y = 132 * SCALE
             rank_text_x = text_x
@@ -1574,32 +1680,48 @@ async def build_profile_card(
 
             rank_line = f"Rank #{rank} of {total_members}"
             draw.text((rank_text_x, rank_y), rank_line, font=font_rank, fill=rank_text_rgb)
+            rank_bbox = draw.textbbox((rank_text_x, rank_y), rank_line, font=font_rank)
+            rank_center_y = (rank_bbox[1] + rank_bbox[3]) / 2
 
             if rank_change is not None:
-                badge_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
-                badge_cy = rank_y + 21 * SCALE
-                if rank_change > 0:
-                    draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=True), fill=RANK_UP_GREEN)
-                    draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(rank_change), font=font_change, fill=RANK_UP_GREEN)
-                elif rank_change < 0:
-                    draw.polygon(_triangle_points(badge_x + 9 * SCALE, badge_cy, 9 * SCALE, pointing_up=False), fill=RANK_DOWN_RED)
-                    draw.text((badge_x + 22 * SCALE, rank_y + 2 * SCALE), str(abs(rank_change)), font=font_change, fill=RANK_DOWN_RED)
-                else:
+                chip_x = rank_text_x + draw.textlength(rank_line, font=font_rank) + 20 * SCALE
+                pad_x, icon_w, icon_gap = 16 * SCALE, 16 * SCALE, 10 * SCALE
+                chip_h = 44 * SCALE
+                chip_y = rank_center_y - chip_h / 2
+                if rank_change == 0:
+                    # Single dash, no separate number — previously this drew
+                    # BOTH a dash-shaped icon AND a literal "-" character
+                    # next to it, showing as two off-center dashes.
+                    chip_w = pad_x * 2 + icon_w
+                    draw.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=chip_h / 2, fill=(
+                        tuple(int(BG_COLOR[i] * 0.75 + MUTED_TEXT[i] * 0.25) for i in range(3)) + (255,)
+                    ))
                     draw.rounded_rectangle(
-                        [badge_x, badge_cy - 3 * SCALE, badge_x + 18 * SCALE, badge_cy + 3 * SCALE],
-                        radius=3 * SCALE, fill=MUTED_TEXT,
+                        [chip_x + pad_x, rank_center_y - 2 * SCALE, chip_x + pad_x + icon_w, rank_center_y + 2 * SCALE],
+                        radius=2 * SCALE, fill=MUTED_TEXT,
+                    )
+                else:
+                    color, icon_up = (RANK_UP_GREEN, True) if rank_change > 0 else (RANK_DOWN_RED, False)
+                    tint = tuple(int(BG_COLOR[i] * 0.75 + color[i] * 0.25) for i in range(3)) + (255,)
+                    num_txt = str(abs(rank_change))
+                    tw = draw.textlength(num_txt, font=font_change)
+                    chip_w = pad_x * 2 + icon_w + icon_gap + tw
+                    draw.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=chip_h / 2, fill=tint)
+                    tri = _triangle_points(chip_x + pad_x + icon_w / 2, rank_center_y, 10 * SCALE, pointing_up=icon_up)
+                    draw.polygon(tri, fill=color)
+                    _centered_text(
+                        draw, chip_x + pad_x + icon_w + icon_gap + tw / 2, rank_center_y, num_txt, font_change, color,
                     )
 
             if personal_bests and (personal_bests.get("best_day_xp") or personal_bests.get("best_week_xp")):
-                pb_font = _find_profile_font(False, 19 * SCALE)
-                parts = []
+                chip_y = 182 * SCALE
+                nx = text_x
                 if personal_bests.get("best_day_xp"):
-                    parts.append(f"Best Day {personal_bests['best_day_xp']:,}")
+                    nx = _pill(draw, nx, chip_y, f"Best Day {personal_bests['best_day_xp']:,} XP", font_chip, BAR_BG, WHITE, h=38 * SCALE) + 10 * SCALE
                 if personal_bests.get("best_week_xp"):
-                    parts.append(f"Best Week {personal_bests['best_week_xp']:,}")
-                draw.text((text_x, 178 * SCALE), "   •   ".join(parts), font=pb_font, fill=MUTED_TEXT)
+                    _pill(draw, nx, chip_y, f"Best Week {personal_bests['best_week_xp']:,} XP", font_chip, BAR_BG, WHITE, h=38 * SCALE)
 
-            stat_y = 205 * SCALE
+            stat_y = 250 * SCALE
             draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
             draw.text((text_x, stat_y + 32 * SCALE), f"{entry['current_xp']:,}", font=font_stat_value, fill=WHITE)
 
@@ -1608,11 +1730,22 @@ async def build_profile_card(
             week_color = ON_TRACK_GREEN if stats["on_track"] else BEHIND_ORANGE
             draw.text((stat_x2, stat_y + 32 * SCALE), f"+{stats['gained_this_week']:,}", font=font_stat_value, fill=week_color)
 
-            draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=14 * SCALE, fill=BAR_BG)
-            draw.text(
-                (bar_x, bar_y - 34 * SCALE), f"Weekly progress — {pct * 100:.0f}%",
-                font=font_bar_label, fill=MUTED_TEXT,
-            )
+            label_y = bar_y - 38 * SCALE
+            draw.text((bar_x, label_y), "WEEKLY PROGRESS", font=font_bar_label, fill=MUTED_TEXT)
+            # 7-day activity dots, right-aligned on the same row as the
+            # label — see get_week_activity_days. Filled = checked in that
+            # day, outlined = didn't, relative to this member's own rolling
+            # tracking week (not necessarily a calendar Monday).
+            dot_r, dot_gap = 8 * SCALE, 10 * SCALE
+            dots_w = 7 * (dot_r * 2) + 6 * dot_gap
+            dcx, dcy = bar_x + bar_w - dots_w, label_y + 9 * SCALE
+            for checked in activity_days:
+                if checked:
+                    draw.ellipse([dcx, dcy, dcx + dot_r * 2, dcy + dot_r * 2], fill=MUTED_TEXT)
+                else:
+                    draw.ellipse([dcx, dcy, dcx + dot_r * 2, dcy + dot_r * 2], outline=MUTED_TEXT, width=2 * SCALE)
+                dcx += dot_r * 2 + dot_gap
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=16 * SCALE, fill=BAR_BG)
 
         def render_solid_frame(
             border_rgb: tuple, tint_background: bool = True, rank_text_override: Optional[tuple] = None,
@@ -1661,7 +1794,10 @@ async def build_profile_card(
 
             _draw_body(card, draw, rank_text_rgb)
             if fill_w:
-                draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=border_rgb)
+                draw.rounded_rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=16 * SCALE, fill=border_rgb)
+            pct_txt = f"{pct * 100:.0f}%"
+            ptw = draw.textlength(pct_txt, font=font_pct)
+            _centered_text(draw, bar_x + bar_w - ptw / 2 - 16 * SCALE, bar_y + bar_h / 2, pct_txt, font_pct, WHITE)
 
             return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)  # downscale — this is what smooths every edge
 
@@ -1709,9 +1845,12 @@ async def build_profile_card(
             if fill_w:
                 bar_mask = Image.new("L", (CARD_W, CARD_H), 0)
                 ImageDraw.Draw(bar_mask).rounded_rectangle(
-                    [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=14 * SCALE, fill=255,
+                    [bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], radius=16 * SCALE, fill=255,
                 )
                 card.paste(color_gradient, (0, 0), bar_mask)
+            pct_txt = f"{pct * 100:.0f}%"
+            ptw = draw.textlength(pct_txt, font=font_pct)
+            _centered_text(draw, bar_x + bar_w - ptw / 2 - 16 * SCALE, bar_y + bar_h / 2, pct_txt, font_pct, WHITE)
 
             return card.resize((FINAL_W, FINAL_H), Image.LANCZOS)
 
@@ -1921,10 +2060,13 @@ class XPThresholdModal(discord.ui.Modal, title="Set XP Threshold"):
         max_length=3,
     )
 
-    def __init__(self, guild_id: int, role: discord.Role):
+    def __init__(self, guild_id: int, role: discord.Role, existing: Optional[dict] = None):
         super().__init__()
         self.guild_id = guild_id
         self.role = role
+        if existing:
+            self.xp_threshold.default = str(existing["xp"])
+            self.sticky.default = "no" if existing.get("exclusive", True) else "yes"
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -1980,7 +2122,7 @@ class AddXPRoleSelectView(discord.ui.View):
         super().__init__(timeout=120)
         self.guild_id = guild_id
 
-    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Choose a role to assign at an XP threshold")
+    @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Choose a role to assign at an XP threshold (or edit an existing one)")
     async def select_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
         role = select.values[0]
         bot_member = interaction.guild.me
@@ -1989,7 +2131,10 @@ class AddXPRoleSelectView(discord.ui.View):
                 "⚠️ I don't have the **Manage Roles** permission in this server yet.", ephemeral=True
             )
             return
-        await interaction.response.send_modal(XPThresholdModal(self.guild_id, role))
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        existing = next((r for r in get_xp_roles(guild_data) if r["role_id"] == role.id), None)
+        await interaction.response.send_modal(XPThresholdModal(self.guild_id, role, existing))
 
 
 class RemoveXPRoleSelectView(discord.ui.View):
@@ -2649,6 +2794,7 @@ HELP_CATEGORIES = [
         ("/checkin xp:<number> [user]", "Record current XP — yours, or (admin) someone else's"),
         ("/status [user]", "Weekly progress, rate, and projection for yourself or another user"),
         ("/undo [user]", "Remove the most recent checkin"),
+        ("/setlift lift: weight: [user]", "Record a deadlift/bench/squat number for your profile"),
         ("/history [user]", "Last 10 checkins for a user"),
         ("/progresschart [user]", "XP-over-time line chart for a user"),
         ("/profile [user]", "Rendered profile card — avatar, rank, border color, progress bar"),
@@ -2677,6 +2823,7 @@ HELP_CATEGORIES = [
     ]),
     ("admin_users", "Admin: Users & Data", "👤", "Correcting, resetting, importing, exporting", [
         ("/setbaseline user: starting_xp:", "Set/correct someone's all-time starting XP"),
+        ("/hide user: enabled:", "Hide/unhide a member from leaderboards — still fully tracked"),
         ("/fullreset user: [clear_history]", "Reset both weekly and all-time totals for one user"),
         ("/removeuser user:<@user>", "Wipe one user's tracking data"),
         ("/removeuserbyid discord_id:<id>", "Same, but by raw ID — works for departed members"),
@@ -2700,6 +2847,7 @@ HELP_CATEGORIES = [
         ("/addbannertier role: name: mode: color1: [color2] priority:", "Tie a banner look to a role"),
         ("/removebannertier role:<@role>", "Remove a role's banner tier"),
         ("/listbannertiers", "Show all configured banner tiers"),
+        ("/setbasecard mode: color1: [color2]", "Set the server's default look for everyone else"),
     ]),
     ("admin_skus", "Admin: SKU Role Automation", "🛒", "Auto-granting roles for Discord purchases/subscriptions", [
         ("/addskurole sku_id: role: name:", "Auto-grant a role while a SKU entitlement is active"),
@@ -2924,10 +3072,14 @@ class RolesSettingsView(discord.ui.View):
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await go_settings_home(interaction, self.guild_id)
 
-    @discord.ui.button(label="Add XP Role", style=discord.ButtonStyle.primary, emoji="🏅")
+    @discord.ui.button(label="Add / Edit XP Role", style=discord.ButtonStyle.primary, emoji="🏅")
     async def add_xp_role(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = AddXPRoleSelectView(self.guild_id)
-        await interaction.response.send_message("Select a role to assign at an XP threshold:", view=view, ephemeral=True)
+        await interaction.response.send_message(
+            "Select a role — picking one that's already configured opens the form pre-filled, so you can just "
+            "edit and resave instead of retyping everything:",
+            view=view, ephemeral=True,
+        )
 
     @discord.ui.button(label="Remove XP Role", style=discord.ButtonStyle.secondary, emoji="🏅")
     async def remove_xp_role(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4113,8 +4265,11 @@ def build_weekly_leaderboard_lines(guild: discord.Guild, guild_data: dict) -> tu
     auto-post task. Caller is responsible for calling save_data() after,
     since building the lines runs ensure_current_week() on every entry."""
     compact = compact_leaderboard_enabled(guild_data)
+    is_premium = is_guild_premium(load_data(), guild.id)
     rows = []
     for uid, entry in guild_data["users"].items():
+        if is_hidden_from_leaderboard(entry):
+            continue
         stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
         rows.append((uid, entry, stats))
 
@@ -4123,6 +4278,11 @@ def build_weekly_leaderboard_lines(guild: discord.Guild, guild_data: dict) -> tu
     for i, (uid, entry, stats) in enumerate(rows, start=1):
         member = guild.get_member(int(uid))
         name = member.display_name if member else f"<@{uid}>"
+        # A star marks anyone with an active banner tier (see /addbannertier)
+        # — same premium gate as the profile card itself, so a lapsed
+        # subscription removes the star here too, not just on /profile.
+        if is_premium and member and get_member_banner_tier(guild_data, member):
+            name = f"⭐ {name}"
         icon = "✅" if stats["on_track"] else "⚠️"
         prorated = " 🆕" if stats["is_prorated"] else ""
         if compact:
@@ -4158,8 +4318,11 @@ def build_total_leaderboard_lines(guild: discord.Guild, guild_data: dict) -> lis
     responsible for save_data() after, since get_baseline() can lazily
     migrate older entries."""
     compact = compact_leaderboard_enabled(guild_data)
+    is_premium = is_guild_premium(load_data(), guild.id)
     rows = []
     for uid, entry in guild_data["users"].items():
+        if is_hidden_from_leaderboard(entry):
+            continue
         baseline_xp, baseline_time = get_baseline(entry)
         total_gained = entry["current_xp"] - baseline_xp
         tracked_days = max((utcnow() - parse_iso(baseline_time)).total_seconds() / 86400, 0)
@@ -4170,6 +4333,8 @@ def build_total_leaderboard_lines(guild: discord.Guild, guild_data: dict) -> lis
     for i, (uid, entry, baseline_xp, total_gained, tracked_days) in enumerate(rows, start=1):
         member = guild.get_member(int(uid))
         name = member.display_name if member else f"<@{uid}>"
+        if is_premium and member and get_member_banner_tier(guild_data, member):
+            name = f"⭐ {name}"
         if compact:
             lines.append(f"{i}. **{name}** — {entry['current_xp']:,} XP (+{total_gained:,})")
         else:
@@ -4426,6 +4591,59 @@ async def setcrewlevelformula(interaction: discord.Interaction, base_xp: int, gr
     )
 
 
+@bot.tree.command(
+    name="setbasecard",
+    description="[Admin] Set the server's default /profile card color/gradient for members with no tier or custom color",
+)
+@app_commands.describe(
+    mode="solid = one color, gradient = two-color sweep",
+    color1="Primary color (hex, e.g. #5C6B73)",
+    color2="Second color (hex) — gradient mode only",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setbasecard(interaction: discord.Interaction, mode: Literal["solid", "gradient"], color1: str, color2: Optional[str] = None):
+    hex1 = _parse_hex_color(color1)
+    if hex1 is None:
+        await interaction.response.send_message(
+            f"`{color1}` doesn't look like a valid hex color — use a format like `#5C6B73`.", ephemeral=True,
+        )
+        return
+
+    hex2 = None
+    color2_raw = (color2 or "").strip()
+    if mode == "gradient":
+        if not color2_raw:
+            await interaction.response.send_message(
+                "Gradient mode needs a second color — that's the color it sweeps into.", ephemeral=True,
+            )
+            return
+        hex2 = _parse_hex_color(color2_raw)
+        if hex2 is None:
+            await interaction.response.send_message(
+                f"`{color2_raw}` doesn't look like a valid hex color — use a format like `#5C6B73`.", ephemeral=True,
+            )
+            return
+    elif color2_raw:
+        hex2 = _parse_hex_color(color2_raw)  # stored but unused outside gradient mode; validate anyway if given
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["default_card_mode"] = mode
+    guild_data["default_card_color1"] = hex1
+    guild_data["default_card_color2"] = hex2
+    save_data(data)
+
+    look = hex1 if mode == "solid" else f"{hex1} → {hex2}"
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Set base profile card look", details=f"{mode} ({look})",
+    )
+    await interaction.response.send_message(
+        f"Default `/profile` look set to **{mode}** ({look}). Applies to anyone with no banner tier and no "
+        f"individually-set `/setbordercolor` — those still take priority over this. Doesn't affect anyone who "
+        f"already has a tier or a custom color set."
+    )
+
+
 @bot.tree.command(name="history", description="Show recent XP checkins for a user")
 @app_commands.describe(user="User to check (defaults to you)")
 @require_tracking_channel()
@@ -4522,16 +4740,24 @@ async def _render_member_profile(
 
     if banner_override is not None:
         banner = banner_override
-        render_entry = entry
     else:
         is_premium = is_guild_premium(load_data(), guild.id)
         banner = get_member_banner_tier(guild_data, member) if is_premium else None
-        render_entry = entry if is_premium else {**entry, "border_color": DEFAULT_BORDER_COLOR}
+        if banner is None:
+            individual_color = entry.get("border_color") if is_premium else None
+            if individual_color:
+                banner = {"mode": "solid", "color1": individual_color, "color2": None, "name": None}
+            else:
+                # The server's admin-configured base look (/setbasecard) —
+                # always applies here regardless of premium, since it's the
+                # server's own default appearance, not a paid perk on top of it.
+                banner = get_default_card_look(guild_data)
+    render_entry = entry
 
     card_buf = await build_profile_card(
         member, render_entry, stats, guild_data["requirement"], rank, total_members,
         rank_change=rank_change, banner=banner, animation_allowed=animation_allowed,
-        personal_bests=get_personal_bests(entry),
+        personal_bests=get_personal_bests(entry), lifts=get_lifts(entry),
     )
     will_animate = animation_allowed and banner is not None and banner["mode"] == "rainbow"
     filename = "profile.gif" if will_animate else "profile.png"
@@ -4699,6 +4925,83 @@ async def undo(interaction: discord.Interaction, user: Optional[discord.Member] 
         description += f"\n🔺 Now qualifies for: {', '.join(r.mention for r in role_result['added'])}"
     embed.description = description
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="hide",
+    description="[Admin] Opt a member out of /weeklyleaderboard and /totalleaderboard — still tracked and counted, just not listed",
+)
+@app_commands.describe(
+    user="Member to hide or unhide",
+    enabled="True to hide from leaderboards, false to show up again",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+@require_tracking_channel()
+async def hide(interaction: discord.Interaction, user: discord.Member, enabled: bool):
+    target = user
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(target.id))
+    if entry is None:
+        await interaction.response.send_message(
+            f"{target.display_name} has no tracking data yet — nothing to hide.", ephemeral=True,
+        )
+        return
+
+    entry["hidden_from_leaderboard"] = enabled
+    save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user,
+        "Hid from leaderboard" if enabled else "Unhid from leaderboard", target=target.mention,
+    )
+
+    who = f"{target.display_name} is"
+    if enabled:
+        await interaction.response.send_message(
+            f"{who} now hidden from `/weeklyleaderboard` and `/totalleaderboard`. Everything else keeps working "
+            f"exactly the same — `/checkin`, `/status`, `/profile`, and crew-wide totals (`/crewtotals`, "
+            f"`/crewlevel`) all still count their XP. "
+            f"Run `/hide user:{target.mention} enabled:false` to show them again.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(f"{who} visible on leaderboards again.", ephemeral=True)
+
+
+@bot.tree.command(name="setlift", description="Record a lift number (deadlift/bench/squat) — shown as a badge on your profile card")
+@app_commands.describe(
+    lift="Which lift",
+    weight="The number to record — whatever unit your crew uses (lbs, kg, in-game units, etc.)",
+    user="Admin only — set someone else's instead of your own",
+)
+@require_tracking_channel()
+async def setlift(interaction: discord.Interaction, lift: Literal["deadlift", "bench", "squat"], weight: int, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    if user is not None and user.id != interaction.user.id:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need the **Manage Server** permission to set someone else's lift.", ephemeral=True
+            )
+            return
+    if weight < 0:
+        await interaction.response.send_message("That can't be negative.", ephemeral=True)
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(target.id))
+    if entry is None:
+        await interaction.response.send_message(
+            f"{'You need' if target.id == interaction.user.id else f'{target.display_name} needs'} to "
+            f"`/checkin` at least once before there's a profile to attach this to.",
+            ephemeral=True,
+        )
+        return
+
+    entry.setdefault("lifts", {})[lift] = weight
+    save_data(data)
+    who = "Your" if target.id == interaction.user.id else f"{target.display_name}'s"
+    await interaction.response.send_message(f"{who} **{lift}** is now recorded as **{weight:,}**.")
 
 
 @bot.tree.command(name="settings", description="[Admin] Open an interactive panel to change server settings")
@@ -6515,6 +6818,7 @@ setannouncechannel.error(_perm_or_premium_error)
 clearannouncechannel.error(_perm_or_premium_error)
 setweeklypost.error(_perm_error)
 setcrewlevelformula.error(_perm_error)
+setbasecard.error(_perm_error)
 adjustcrewxp.error(_perm_error)
 clearweeklypost.error(_perm_error)
 setinactivitychannel.error(_perm_or_premium_error)
@@ -6578,6 +6882,8 @@ progresschart.error(_channel_error)
 profile_cmd.error(_channel_error)
 crewtotals.error(_channel_error)
 undo.error(_channel_error)
+hide.error(_perm_or_premium_error)
+setlift.error(_channel_error)
 removeallusers.error(_perm_error)
 
 
