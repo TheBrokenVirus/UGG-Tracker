@@ -18,6 +18,7 @@ import json
 import math
 import colorsys
 import asyncio
+import gc
 from pathlib import Path
 from typing import Optional, Literal
 from datetime import datetime, timedelta, timezone
@@ -1434,12 +1435,32 @@ def get_rank_change(entry: dict, current_rank: int) -> Optional[int]:
 # a time regardless of count.
 #
 # Rendered at a lower supersampling factor than the static card (3x vs
-# 5x) since it's paid for once per frame instead of once total — still
+# 4x) since it's paid for once per frame instead of once total — still
 # enough headroom for clean edges after the downscale to FINAL_W/FINAL_H.
 ANIMATED_PROFILE_FRAMES = 26
 ANIMATED_PROFILE_FRAME_MS = 210
 ANIMATED_PROFILE_SCALE = 3
-STATIC_PROFILE_SCALE = 5
+# Was 5 — at the card's current size (grown from 900x340 to 1040x450 over
+# this project's life, plus badges/chips adding more full-size mask
+# layers per render), 5x supersampling meant a single static render's
+# peak memory was ~430MB, measured directly (see the memory-cap fix
+# below for the full story). 4x still gives ~2.7x supersampling after
+# the downscale to FINAL_W/FINAL_H — comfortably enough for clean
+# anti-aliased edges — for meaningfully less memory per render.
+STATIC_PROFILE_SCALE = 4
+
+# Caps how many /profile renders can run at once — the single biggest,
+# most memory-hungry thing this bot does (a static render peaks around
+# 250-450MB, measured directly; an animated one more). Rendering runs in
+# a thread pool executor specifically so it can't block the bot's event
+# loop, but that fix has a real side effect: multiple people running
+# /profile close together can now render truly concurrently, each one
+# needing its own full peak. Without a cap, enough concurrent renders can
+# add up to several times any single render's peak — this trades a little
+# latency (extra renders queue instead of running immediately) for a hard
+# ceiling on how much memory rendering can ever use at once, regardless
+# of how many people ask for a card in the same moment.
+PROFILE_RENDER_SEMAPHORE = asyncio.Semaphore(2)
 
 async def build_profile_card(
     member: discord.abc.User, entry: dict, stats: dict, requirement: int, rank: int, total_members: int,
@@ -1958,17 +1979,18 @@ async def build_profile_card(
         return buf
 
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _render_sync)
+    async with PROFILE_RENDER_SEMAPHORE:
+        result = await loop.run_in_executor(None, _render_sync)
     # Encourages CPython to actually return freed memory to the allocator's
     # arenas promptly. This function runs in a persistent thread pool
     # (run_in_executor's default executor reuses threads), and CPython
     # doesn't always release memory from a burst of large, short-lived
     # allocations back to the OS immediately on its own — over repeated
-    # /profile calls for rainbow-tier members, that can look like a slow
-    # memory leak even though every individual call is well-behaved.
-    if mode == "rainbow":
-        import gc
-        gc.collect()
+    # /profile calls, that can look like a slow memory leak even though
+    # every individual call is well-behaved. Runs after every render now,
+    # not just rainbow ones — the card's grown enough that static renders
+    # are no longer cheap to skip this for either.
+    gc.collect()
     return result
 
 # ---------------------------------------------------------------------------
