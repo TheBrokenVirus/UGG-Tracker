@@ -81,11 +81,13 @@ weekly requirement (default: 20,000 XP/week).
 | `/setcrewlevelformula base_xp: growth_rate:` | Admin | Sets the level-1→2 XP cost and the per-level growth rate `/crewlevel` uses. See "Crew level" below. |
 | `/adjustcrewxp amount:` | Admin | Manually adds (or subtracts, with a negative number) from the crew's combined XP total used by `/crewtotals` and `/crewlevel`. See "Crew level" below. |
 | `/history [user]` | Everyone | Last 10 checkins for a user. |
-| `/undo [user]` | Everyone (own checkins); Admin for others | Remove the most recent checkin and revert current XP to the one before it. If it was someone's only checkin, tracking resets entirely. |
+| `/undo [user]` | Everyone (own checkins); Admin for others | Remove the most recent checkin and revert current XP to the one before it. Also re-checks XP milestone roles against the reverted total — a role earned only because of the undone checkin gets removed. If it was someone's only checkin, tracking resets entirely and any earned role is stripped the same way. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
 | `/togglerecentrate enabled:<true/false>` | Admin | Show or hide the "Recent Rate" field server-wide. See note below. |
 | `/togglecompactleaderboard enabled:<true/false>` | Admin | Switch `/weeklyleaderboard` and `/totalleaderboard` between full-detail and compact one-line-per-person entries. |
 | `/setproratethreshold days: hours: minutes:` | Admin | Control how late someone must join to get a prorated requirement (see below). Default: any lateness at all. |
+| `/setxpratecap rate:` | Admin | Rejects a self-checkin outright if it implies more than this many XP/hr. See "XP rate cap" below. |
+| `/clearxpratecap` | Admin | Turns the XP rate cap off — any self-checkin amount is accepted again. |
 | `/addxprole xp:<number> role:<@role> [exclusive]` | Admin | Auto-assign a role once someone's total XP reaches this amount. Retroactively grants it to anyone who already qualifies. `exclusive: true` (default) makes it part of a tier ladder — reaching a higher tier removes it. `exclusive: false` makes it permanent, kept regardless of what else is earned later (e.g. a standing crew role). |
 | `/removexprole role:<@role>` | Admin | Stop auto-assigning a role at its XP milestone. Doesn't strip the role from people who already have it. |
 | `/listxproles` | Everyone | Show all configured XP milestone roles and their thresholds. |
@@ -247,6 +249,20 @@ The bot can automatically assign a Discord role once someone's total XP crosses 
 - Roles are re-evaluated **on that person's next checkin** — not instantly for everyone the moment you change a setting. If you update the bot, add a bunch of thresholds, or import a big batch of members, some people might carry outdated role combinations until they check in again. Run `/syncxproles` (or the panel's "Sync XP Roles Now") to force a full re-check of everyone immediately instead of waiting.
 - Roles are checked on `/checkin` and `/importxp` — the two places XP actually gets recorded.
 - `/listxproles` marks each configured role 🪜 ladder or 🔒 sticky so you can see the setup at a glance.
+
+## XP rate cap
+
+```
+/setxpratecap rate:10000
+```
+
+Since XP is self-reported (the bot has no way to read it directly from the game), nothing stops someone from typing in an inflated number by mistake — or on purpose. This gives admins a sanity check: if a self-checkin implies more XP per hour than the configured cap, it's **rejected outright** — nothing gets recorded, not even partially. The member sees exactly why (their implied rate, the cap, and how much time the gain was spread over) and is told an admin can check them in directly instead, which bypasses the cap entirely — that's the trusted correction path, not something this is meant to block.
+
+**What "does not apply to starting XP" means in practice:** someone's very first `/checkin` ever has nothing to compute a rate against — there's no previous checkin, so there's no implied rate, so the cap can't apply and never blocks it. It only ever evaluates the gap between two checkins.
+
+**The cap only affects self-checkins, not admin corrections.** An admin running `/checkin user:@someone` bypasses it completely, on the theory that an admin is the trusted mechanism *for* fixing bad numbers — same reasoning as why `/setbaseline` and `/setweekprogress` aren't rate-limited either. Pick a number a bit above what's actually achievable in your game in an hour; the point is catching typos and obviously-wrong numbers, not being stingy with legitimately fast progress.
+
+Off by default — nothing is rejected until an admin sets a cap with `/setxpratecap`. Turn it back off anytime with `/clearxpratecap`.
 
 ## Weekly date range
 

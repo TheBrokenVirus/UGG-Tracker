@@ -176,6 +176,7 @@ def default_guild_data() -> dict:
         "banked_removed_xp": 0,
         "banked_removed_gained": 0,
         "crew_xp_adjustment": 0,
+        "max_checkin_xp_per_hour": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -368,19 +369,24 @@ async def apply_xp_roles(
 
     to_add, to_remove = [], []
 
-    # Exclusive ladder: keep only the highest qualifying tier.
+    # Exclusive ladder: keep only the highest qualifying tier — or none,
+    # if they no longer qualify for any tier at all (e.g. reverted by
+    # /undo back below every threshold). Previously this only removed
+    # OTHER exclusive roles when swapping to a new qualifying tier; if
+    # nobody qualified at all, the removal loop never ran, silently
+    # leaving a now-unearned role in place.
     exclusive_qualifying = [m for m in exclusive_roles if current_xp >= m["xp"]]
-    if exclusive_qualifying:
-        target_mapping = exclusive_qualifying[-1]  # ascending sort, so last = highest qualifying tier
-        target_role = guild.get_role(target_mapping["role_id"])
+    keep_role_id = exclusive_qualifying[-1]["role_id"] if exclusive_qualifying else None  # ascending sort, so last = highest qualifying tier
+    if keep_role_id is not None:
+        target_role = guild.get_role(keep_role_id)
         if target_role and target_role not in member.roles:
             to_add.append(target_role)
-        for mapping in exclusive_roles:
-            if mapping["role_id"] == target_mapping["role_id"]:
-                continue
-            role = guild.get_role(mapping["role_id"])
-            if role and role in member.roles:
-                to_remove.append(role)
+    for mapping in exclusive_roles:
+        if mapping["role_id"] == keep_role_id:
+            continue
+        role = guild.get_role(mapping["role_id"])
+        if role and role in member.roles:
+            to_remove.append(role)
 
     # Sticky roles: add if earned, never remove.
     for mapping in sticky_roles:
@@ -650,6 +656,12 @@ def get_crew_xp_adjustment(guild_data: dict) -> int:
     to backfill XP from removals that happened before that feature
     existed (see bank_removed_user's docstring)."""
     return guild_data.get("crew_xp_adjustment", 0)
+
+def get_max_checkin_rate(guild_data: dict) -> Optional[float]:
+    """Backward-compatible getter — the max plausible XP/hr a self-checkin
+    can imply before it's rejected outright (see /setxpratecap). None
+    means no cap configured."""
+    return guild_data.get("max_checkin_xp_per_hour")
 
 def get_personal_bests(entry: dict) -> dict:
     """Backward-compatible getter — entries created before this feature
@@ -2656,6 +2668,8 @@ HELP_CATEGORIES = [
         ("/setweekprogressall days: hours: minutes:", "Backdate everyone's week progress at once"),
         ("/resetweek user:<@user>", "Restart one user's weekly window right now"),
         ("/setproratethreshold days: hours: minutes:", "How late is \"late enough\" to prorate a first week"),
+        ("/setxpratecap rate:", "Reject self-checkins implying more than this many XP/hr"),
+        ("/clearxpratecap", "Turn off the XP rate cap"),
     ]),
     ("admin_crewlevel", "Admin: Crew Level", "🏰", "The exponential formula behind /crewlevel", [
         ("/setcrewlevelformula base_xp: growth_rate:", "Set the level-1→2 XP and per-level growth rate"),
@@ -4003,6 +4017,33 @@ async def checkin(interaction: discord.Interaction, xp: int, user: Optional[disc
     else:
         note = None
 
+    # Rate cap: rejects a checkin outright if it implies an unrealistic
+    # XP/hr gain, configured with /setxpratecap. Checked BEFORE
+    # record_checkin does anything, using the entry's still-unmutated last
+    # checkin, so a rejected checkin leaves absolutely no trace — nothing
+    # to undo. Doesn't apply to someone's very first checkin (that branch
+    # already returned above, there's no prior checkin to compare against
+    # anyway) or to an admin checking someone else in (target.id !=
+    # interaction.user.id) — that's already a trusted correction path
+    # gated by Manage Server, not the self-reported number this cap
+    # exists to sanity-check.
+    max_rate = get_max_checkin_rate(guild_data)
+    if max_rate and target.id == interaction.user.id and entry["checkins"]:
+        last_checkin = entry["checkins"][-1]
+        rate_gain = xp - last_checkin["xp"]
+        if rate_gain > 0:
+            rate_hours = max((utcnow() - parse_iso(last_checkin["time"])).total_seconds() / 3600, 1 / 3600)
+            implied_rate = rate_gain / rate_hours
+            if implied_rate > max_rate:
+                await interaction.response.send_message(
+                    f"⛔ That checkin implies **{implied_rate:,.0f} XP/hr** (+{rate_gain:,} XP over "
+                    f"{format_duration(rate_hours)}), above this server's cap of **{max_rate:,.0f} XP/hr**. "
+                    f"Nothing was recorded. If this gain is legitimate, ask an admin to check you in directly "
+                    f"with `/checkin user:` — that bypasses the cap.",
+                    ephemeral=True,
+                )
+                return
+
     last = record_checkin(entry, xp)
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
     save_data(data)
@@ -4617,19 +4658,27 @@ async def undo(interaction: discord.Interaction, user: Optional[discord.Member] 
         return
 
     if len(entry["checkins"]) == 1:
-        # Undoing the only checkin means wiping the user's tracking entirely.
+        # Undoing the only checkin means wiping the user's tracking entirely
+        # — treated as dropping to 0 XP for role purposes, so any earned
+        # exclusive-tier role gets stripped along with the data. Sticky
+        # roles are untouched, same as everywhere else apply_xp_roles runs.
         del guild_data["users"][str(target.id)]
+        role_result = await apply_xp_roles(interaction.guild, target, guild_data, 0, announce=False)
         save_data(data)
         if target.id != interaction.user.id:
             await log_admin_action(interaction.guild, guild_data, interaction.user, "Undo (removed only checkin)", target=target.mention)
+        role_note = ""
+        if role_result["removed"]:
+            role_note = f" Removed role(s) no longer earned: {', '.join(r.mention for r in role_result['removed'])}."
         await interaction.response.send_message(
             f"Removed {target.display_name}'s only checkin — tracking has been reset. "
-            f"Use `/checkin` to start again."
+            f"Use `/checkin` to start again.{role_note}"
         )
         return
 
     removed = entry["checkins"].pop()
     entry["current_xp"] = entry["checkins"][-1]["xp"]
+    role_result = await apply_xp_roles(interaction.guild, target, guild_data, entry["current_xp"], announce=False)
     save_data(data)
     if target.id != interaction.user.id:
         await log_admin_action(
@@ -4640,10 +4689,15 @@ async def undo(interaction: discord.Interaction, user: Optional[discord.Member] 
     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
     embed = build_status_embed(target, entry, stats, guild_data["requirement"], show_recent_rate=show_recent_rate_enabled(guild_data))
     removed_time = int(parse_iso(removed["time"]).timestamp())
-    embed.description = (
+    description = (
         f"Undid checkin of **{removed['xp']:,} XP** recorded <t:{removed_time}:R>. "
         f"Current XP reverted to **{entry['current_xp']:,}**."
     )
+    if role_result["removed"]:
+        description += f"\n🔻 No longer qualifies for: {', '.join(r.mention for r in role_result['removed'])}"
+    if role_result["added"]:
+        description += f"\n🔺 Now qualifies for: {', '.join(r.mention for r in role_result['added'])}"
+    embed.description = description
     await interaction.response.send_message(embed=embed)
 
 
@@ -4729,6 +4783,43 @@ async def setproratethreshold(interaction: discord.Interaction, days: int = 0, h
             f"week for their requirement to be prorated. Joining earlier than that uses the full requirement."
         )
     await interaction.response.send_message(f"Prorate threshold set to {format_duration(threshold_hours)}. {note}")
+
+
+@bot.tree.command(
+    name="setxpratecap",
+    description="[Admin] Reject self-checkins that imply an unrealistic XP/hr gain",
+)
+@app_commands.describe(rate="Max plausible XP per hour — a checkin implying more than this is rejected outright")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setxpratecap(interaction: discord.Interaction, rate: int):
+    if rate <= 0:
+        await interaction.response.send_message(
+            "Rate must be a positive number. Use `/clearxpratecap` to turn the cap off entirely.", ephemeral=True
+        )
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["max_checkin_xp_per_hour"] = rate
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Set XP rate cap", details=f"{rate:,} XP/hr")
+    await interaction.response.send_message(
+        f"XP rate cap set to **{rate:,} XP/hr**. A self-checkin implying more than that gets rejected outright — "
+        f"nothing is recorded, and the member is told to ask an admin to check them in directly instead, which "
+        f"bypasses the cap. Doesn't apply to anyone's very first checkin (starting XP), since there's no prior "
+        f"checkin yet to compute a rate from."
+    )
+
+
+@bot.tree.command(name="clearxpratecap", description="[Admin] Turn off the XP rate cap — allow any self-checkin amount")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clearxpratecap(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["max_checkin_xp_per_hour"] = None
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Cleared XP rate cap")
+    await interaction.response.send_message("XP rate cap removed — self-checkins are no longer rejected for implying a fast gain.")
 
 
 @bot.tree.command(
@@ -6447,6 +6538,8 @@ togglerecentrate.error(_perm_error)
 toggleanimatedprofile.error(_perm_error)
 togglecompactleaderboard.error(_perm_error)
 setproratethreshold.error(_perm_error)
+setxpratecap.error(_perm_error)
+clearxpratecap.error(_perm_error)
 addxprole.error(_perm_error)
 removexprole.error(_perm_error)
 syncxproles.error(_perm_error)
