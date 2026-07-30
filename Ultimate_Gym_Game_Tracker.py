@@ -1587,21 +1587,35 @@ async def build_profile_card(
         font_stat_label = _find_profile_font(False, 23 * SCALE)
         font_stat_value = _find_profile_font(True, 34 * SCALE)
         font_bar_label = _find_profile_font(True, 18 * SCALE)
-        font_badge = _find_profile_font(True, 20 * SCALE)
-        font_chip = _find_profile_font(True, 17 * SCALE)
-        font_lift = _find_profile_font(True, 16 * SCALE)
+        font_badge = _find_profile_font(True, 27 * SCALE)
+        font_chip = _find_profile_font(True, 22 * SCALE)
+        font_lift_label = _find_profile_font(False, 28 * SCALE)
+        font_lift_value = _find_profile_font(True, 28 * SCALE)
         font_pct = _find_profile_font(True, 19 * SCALE)
 
         _measure_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
-        # A tier badge and/or a lift-badge row (both drawn in _draw_body)
-        # can sit in the top-right corner — their combined width is
-        # measured here (not guessed) so the name reserves precisely
-        # enough room to truncate before running under either one,
-        # whichever is wider, instead of a fixed guess.
-        LIFT_CHIP_W, LIFT_CHIP_GAP = 78 * SCALE, 8 * SCALE
+        # A tier badge and/or a lift list (both drawn in _draw_body) can
+        # sit in the top-right corner — their combined width is measured
+        # here (not guessed) so the name reserves precisely enough room
+        # to truncate before running under either one, whichever is
+        # wider, instead of a fixed guess.
+        LIFT_ROWS = (("Deadlift", "deadlift"), ("Bench", "bench"), ("Squat", "squat"))
+        LIFT_ROW_H = 42 * SCALE
         show_lifts = bool(lifts) and any(lifts.get(k) is not None for k in ("deadlift", "bench", "squat"))
-        lifts_row_w = 3 * LIFT_CHIP_W + 2 * LIFT_CHIP_GAP if show_lifts else 0
+        # Wide enough for the longest label + " 999,999 kg" at this font,
+        # measured rather than guessed, same reasoning as the badge above.
+        lifts_row_w = 0
+        if show_lifts:
+            for label, key in LIFT_ROWS:
+                val = lifts.get(key)
+                val_txt = f"{val:,} kg" if val is not None else "—"
+                row_w = (
+                    _measure_draw.textlength(label, font=font_lift_label)
+                    + 24 * SCALE
+                    + _measure_draw.textlength(val_txt, font=font_lift_value)
+                )
+                lifts_row_w = max(lifts_row_w, row_w)
 
         badge_reserve = 0
         if banner is not None and banner.get("name"):
@@ -1638,14 +1652,21 @@ async def build_profile_card(
             w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
             draw.text((cx - w / 2 - bbox[0], cy - h / 2 - bbox[1]), text, font=font, fill=fill)
 
-        def _pill(draw, x, y, text, font, fill, text_color, h=None):
-            """A simple rounded-rect label pill — used for the Best Day/
-            Best Week and rank-change chips. Returns the pill's right edge."""
+        def _pill(draw, x, y, text, font, fill, text_color, h=None, radius=None):
+            """A simple rounded-rect label pill — used for the Best Day
+            chip and the rank-change chip. Returns the pill's right edge.
+            radius defaults to a modest rounded-rect corner rather than a
+            full stadium shape (radius=h/2) — a stadium's curved leftmost
+            point visually reads as offset from flat-edged text directly
+            above it at the same X, even though the bounding box itself
+            is exactly aligned. A smaller radius keeps enough of a
+            left edge to actually look flush."""
             tw = draw.textlength(text, font=font)
             pad = 12 * SCALE
             h = h or (font.size + 18 * SCALE)
             w = tw + pad * 2
-            draw.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, fill=fill)
+            radius = radius if radius is not None else 12 * SCALE
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=radius, fill=fill)
             _centered_text(draw, x + w / 2, y + h / 2, text, font, text_color)
             return x + w
 
@@ -1666,7 +1687,7 @@ async def build_profile_card(
                 badge_fg = _contrast_text_color(badge_bg)
                 pad_x, pad_y = 16 * SCALE, 8 * SCALE
                 text_w = draw.textlength(badge_text, font=font_badge)
-                badge_h = 20 * SCALE + pad_y * 2
+                badge_h = font_badge.size + pad_y * 2
                 badge_w = text_w + pad_x * 2
                 badge_x2 = CARD_W - 26 * SCALE
                 badge_x1 = badge_x2 - badge_w
@@ -1679,16 +1700,15 @@ async def build_profile_card(
 
             if show_lifts:
                 lift_y = badge_bottom + (14 * SCALE if banner is not None and banner.get("name") else 0)
-                lx = CARD_W - 26 * SCALE - lifts_row_w
-                for label, key in (("DL", "deadlift"), ("BP", "bench"), ("SQ", "squat")):
+                lift_x2 = CARD_W - 26 * SCALE  # right edge — values align here
+                lift_x1 = lift_x2 - lifts_row_w  # left edge — labels align here
+                for i, (label, key) in enumerate(LIFT_ROWS):
+                    row_y = lift_y + i * LIFT_ROW_H
                     val = lifts.get(key)
-                    txt = f"{label} {val:,}" if val is not None else f"{label} -"
-                    draw.rounded_rectangle(
-                        [lx, lift_y, lx + LIFT_CHIP_W, lift_y + 40 * SCALE], radius=10 * SCALE,
-                        outline=MUTED_TEXT, width=2 * SCALE,
-                    )
-                    _centered_text(draw, lx + LIFT_CHIP_W / 2, lift_y + 20 * SCALE, txt, font_lift, MUTED_TEXT)
-                    lx += LIFT_CHIP_W + LIFT_CHIP_GAP
+                    val_txt = f"{val:,} kg" if val is not None else "—"
+                    draw.text((lift_x1, row_y), label, font=font_lift_label, fill=MUTED_TEXT)
+                    vtw = draw.textlength(val_txt, font=font_lift_value)
+                    draw.text((lift_x2 - vtw, row_y), val_txt, font=font_lift_value, fill=WHITE)
 
             rank_y = 132 * SCALE
             rank_text_x = text_x
@@ -1734,13 +1754,9 @@ async def build_profile_card(
                         draw, chip_x + pad_x + icon_w + icon_gap + tw / 2, rank_center_y, num_txt, font_change, color,
                     )
 
-            if personal_bests and (personal_bests.get("best_day_xp") or personal_bests.get("best_week_xp")):
+            if personal_bests and personal_bests.get("best_day_xp"):
                 chip_y = 182 * SCALE
-                nx = text_x
-                if personal_bests.get("best_day_xp"):
-                    nx = _pill(draw, nx, chip_y, f"Best Day {personal_bests['best_day_xp']:,} XP", font_chip, BAR_BG, WHITE, h=38 * SCALE) + 10 * SCALE
-                if personal_bests.get("best_week_xp"):
-                    _pill(draw, nx, chip_y, f"Best Week {personal_bests['best_week_xp']:,} XP", font_chip, BAR_BG, WHITE, h=38 * SCALE)
+                _pill(draw, text_x, chip_y, f"Best Day {personal_bests['best_day_xp']:,} XP", font_chip, BAR_BG, WHITE, h=38 * SCALE)
 
             stat_y = 250 * SCALE
             draw.text((text_x, stat_y), "CREW XP", font=font_stat_label, fill=MUTED_TEXT)
@@ -5844,6 +5860,7 @@ async def importxp(
 
     created, checked_in, reset_list, skipped, unmatched, ambiguous, bad_rows = [], [], [], [], [], [], []
     roles_assigned_count = 0
+    total_checkin_gain = 0
 
     for row in rows:
         xp_val = find_xp_for_row(row)
@@ -5873,8 +5890,12 @@ async def importxp(
             # Same as a normal /checkin: appends to their history and moves
             # current_xp, but leaves baseline_xp and week_start_xp alone —
             # this is what makes it a mass check-in rather than a reset.
+            prev_xp = existing["current_xp"]
             record_checkin(existing, xp_val)
-            checked_in.append(f"{member.display_name} ({xp_val:,}){tag}")
+            gain = xp_val - prev_xp
+            total_checkin_gain += gain
+            gain_note = f", +{gain:,}" if gain > 0 else (f", {gain:,}" if gain < 0 else "")
+            checked_in.append(f"{member.display_name} ({xp_val:,}{gain_note}){tag}")
         elif existing and mode == "reset":
             now = utcnow()
             existing["current_xp"] = xp_val
@@ -5912,7 +5933,10 @@ async def importxp(
     embed = discord.Embed(title="📥 XP Import Results", color=discord.Color.green())
     embed.add_field(name=f"✅ Newly tracked ({len(created)})", value=fmt_list(created), inline=False)
     if mode == "checkin":
-        embed.add_field(name=f"🔁 Checked in ({len(checked_in)})", value=fmt_list(checked_in), inline=False)
+        checkin_header = f"🔁 Checked in ({len(checked_in)})"
+        if total_checkin_gain:
+            checkin_header += f" — {total_checkin_gain:+,} XP total"
+        embed.add_field(name=checkin_header, value=fmt_list(checked_in), inline=False)
     elif mode == "reset":
         embed.add_field(name=f"♻️ Reset ({len(reset_list)})", value=fmt_list(reset_list), inline=False)
     else:
