@@ -18,6 +18,7 @@ import json
 import math
 import colorsys
 import asyncio
+from aiohttp import web, ClientSession
 import gc
 from pathlib import Path
 from typing import Optional, Literal
@@ -181,6 +182,8 @@ def default_guild_data() -> dict:
         "default_card_mode": "solid",
         "default_card_color1": None,
         "default_card_color2": None,
+        "roblox_links": {},
+        "bloxlink_api_key": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -585,7 +588,7 @@ def build_leaderboard_payload(guild_data: dict, title: str, lines: list, color: 
     embed.set_footer(text=footer)
     return embed, None
 
-def create_user(guild_data: dict, user_id: int, xp: int) -> dict:
+def create_user(guild_data: dict, user_id: int, xp: int, source: str = "manual") -> dict:
     """Starts tracking a new user. If the guild has a shared week_anchor set
     (via /setweekprogressall), the user's week is aligned to it instead of
     starting a fresh 7-day window from right now — this keeps late joiners
@@ -606,7 +609,7 @@ def create_user(guild_data: dict, user_id: int, xp: int) -> dict:
         "baseline_time": iso(now),
         "week_start_time": iso(week_start),
         "week_start_xp": xp,
-        "checkins": [{"time": iso(now), "xp": xp}],
+        "checkins": [{"time": iso(now), "xp": xp, "source": source}],
         "best_day_xp": 0,
         "best_day_date": None,
         "best_week_xp": 0,
@@ -686,6 +689,43 @@ def get_week_activity_days(entry: dict) -> list:
         if 0 <= day_index < 7:
             days[day_index] = True
     return days
+
+async def bloxlink_discord_to_roblox(guild_id: int, discord_user_id: int, api_key: str) -> Optional[str]:
+    """Resolves a Discord user's verified Roblox ID via Bloxlink's public
+    Guild API, or None if they're not verified. Raises RuntimeError with
+    the raw response text on anything unexpected, so a caller can surface
+    it for debugging rather than silently treating a malformed response
+    as "not verified."
+
+    ⚠️ CONFIDENCE NOTE: the roblox-to-discord direction of this API is
+    confirmed against Bloxlink's own current docs
+    (blox.link/docs/guild/roblox-to-discord/languages/javascript.txt —
+    GET https://api.blox.link/v4/public/guilds/{guildId}/roblox-to-discord/{robloxId},
+    header Authorization: <key>). This discord-to-roblox direction is
+    inferred by symmetry with that confirmed pattern and Bloxlink's own
+    SDK method naming (discordToRoblox), NOT independently confirmed —
+    there was no real API key available to test this against live. If
+    this raises RuntimeError with an unexpected response shape once
+    tested against a real key, that's this exact assumption needing a
+    small adjustment, not a deeper problem."""
+    url = f"https://api.blox.link/v4/public/guilds/{guild_id}/discord-to-roblox/{discord_user_id}"
+    async with ClientSession() as session:
+        async with session.get(url, headers={"Authorization": api_key}) as resp:
+            if resp.status == 404:
+                return None  # not verified with Bloxlink
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"Bloxlink returned HTTP {resp.status}: {text[:300]}")
+            try:
+                body = await resp.json(content_type=None)
+            except Exception:
+                raise RuntimeError(f"Bloxlink response wasn't valid JSON: {text[:300]}")
+            # Defensive parsing — accepts a few plausible shapes since the
+            # exact one isn't independently confirmed (see note above).
+            for key in ("robloxID", "robloxId", "robloxid"):
+                if key in body and body[key]:
+                    return str(body[key])
+            raise RuntimeError(f"Unexpected Bloxlink response shape: {text[:300]}")
 
 def get_lifts(entry: dict) -> dict:
     """Backward-compatible getter — the three lift badges shown as
@@ -925,8 +965,14 @@ def ensure_current_week(entry: dict) -> bool:
         rolled = True
     return rolled
 
-def record_checkin(entry: dict, xp: int) -> Optional[dict]:
+def record_checkin(entry: dict, xp: int, source: str = "manual") -> Optional[dict]:
     """Records a new checkin, returns the previous checkin (or None).
+
+    source is stored on the checkin itself ("manual", "admin", or
+    "roblox_api") purely for future display/debugging — e.g. /history or
+    the catch-up-checkin flag could eventually show which system produced
+    an irregular number. Defaults to "manual" so every existing call site
+    is unaffected.
 
     Also tracks the highest single-day XP gain ever recorded
     (best_day_xp). A "day" here means the calendar-UTC-date of the
@@ -953,7 +999,7 @@ def record_checkin(entry: dict, xp: int) -> Optional[dict]:
                 entry["best_day_date"] = today
 
     entry["current_xp"] = xp
-    entry["checkins"].append({"time": iso(now), "xp": xp})
+    entry["checkins"].append({"time": iso(now), "xp": xp, "source": source})
     if len(entry["checkins"]) > MAX_CHECKINS_STORED:
         entry["checkins"] = entry["checkins"][-MAX_CHECKINS_STORED:]
     return last
@@ -5103,6 +5149,93 @@ async def setlift(interaction: discord.Interaction, lift: Literal["deadlift", "b
     await interaction.response.send_message(f"{who} **{lift}** is now recorded as **{weight:,}**.")
 
 
+@bot.tree.command(
+    name="setbloxlinkkey",
+    description="[Admin] Set this server's Bloxlink API key, used to resolve verified Roblox links",
+)
+@app_commands.describe(api_key="Your server's Bloxlink Guild API Key, from Bloxlink's dashboard")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setbloxlinkkey(interaction: discord.Interaction, api_key: str):
+    api_key = api_key.strip()
+    if not api_key:
+        await interaction.response.send_message("That's empty — paste the actual key.", ephemeral=True)
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["bloxlink_api_key"] = api_key
+    save_data(data)
+    # Deliberately NOT passing the key itself into the admin log — logging
+    # a secret into a channel defeats the point of it being a secret.
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Set Bloxlink API key")
+    await interaction.response.send_message(
+        "Bloxlink API key saved. Run `/syncbloxlink` to resolve everyone who's already Bloxlink-verified — "
+        "no action needed from members who've verified with Bloxlink in any server before.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="syncbloxlink",
+    description="[Admin] Resolve Roblox links for server members already verified with Bloxlink",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def syncbloxlink(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    api_key = guild_data.get("bloxlink_api_key")
+    if not api_key:
+        await interaction.response.send_message(
+            "No Bloxlink API key set for this server yet — run `/setbloxlinkkey` first.", ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    linked, already_linked, not_verified, errored = 0, 0, 0, 0
+    error_examples = []
+    roblox_links = guild_data.setdefault("roblox_links", {})
+    existing_discord_ids = set(roblox_links.values())
+
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        if str(member.id) in existing_discord_ids:
+            already_linked += 1
+            continue
+        try:
+            roblox_id = await bloxlink_discord_to_roblox(interaction.guild_id, member.id, api_key)
+        except RuntimeError as e:
+            errored += 1
+            if len(error_examples) < 3:
+                error_examples.append(str(e))
+            continue
+        if roblox_id is None:
+            not_verified += 1
+            continue
+        roblox_links[roblox_id] = str(member.id)
+        existing_discord_ids.add(str(member.id))
+        linked += 1
+
+    save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user, "Synced Bloxlink links",
+        details=f"{linked} newly linked, {already_linked} already linked, {not_verified} not verified, {errored} errors.",
+    )
+
+    summary = (
+        f"**Bloxlink sync complete:**\n"
+        f"✅ {linked} newly linked (no action needed from them — already verified with Bloxlink)\n"
+        f"↩️ {already_linked} already linked from a previous sync\n"
+        f"❌ {not_verified} not verified with Bloxlink yet\n"
+    )
+    if errored:
+        summary += f"⚠️ {errored} lookups failed unexpectedly — this usually means the API response shape didn't match what was expected, worth reporting.\n"
+        for ex in error_examples:
+            summary += f"  `{ex[:200]}`\n"
+    await interaction.followup.send(summary, ephemeral=True)
+
+
 @bot.tree.command(name="settings", description="[Admin] Open an interactive panel to change server settings")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def settings_cmd(interaction: discord.Interaction):
@@ -6992,7 +7125,121 @@ undo.error(_channel_error)
 hide.error(_perm_or_premium_error)
 ignorerequirement.error(_perm_or_premium_error)
 setlift.error(_channel_error)
+setbloxlinkkey.error(_perm_error)
+syncbloxlink.error(_perm_error)
 removeallusers.error(_perm_error)
+
+
+# ---------------------------------------------------------------------------
+# Roblox HTTP API (for automatic in-game XP tracking)
+# ---------------------------------------------------------------------------
+#
+# ⚠️  SECURITY: THERE IS NO AUTHENTICATION ON THIS ENDPOINT YET.
+# Anyone who can reach this URL can write arbitrary XP for any linked
+# player in any server the bot is in, simply by supplying that server's
+# guild_id directly in the request body — nothing currently verifies the
+# request actually came from that server's real Roblox game. This is a
+# deliberate, temporary state: an api-key -> guild_id mapping (checked
+# before anything else runs) is the planned next step, not yet built.
+#
+# DO NOT point a real, live Roblox game at this endpoint, and DO NOT
+# expose this port to the public internet, until that's in place. This
+# exists right now purely so the networking/binding piece (see Discloud's
+# TYPE=site + port 8080 + host 0.0.0.0 requirements) can be tested
+# end to end, and so the request/response shape is settled before auth
+# gets layered on top of it.
+#
+# Reuses the exact same functions /checkin already uses (create_user,
+# record_checkin, apply_xp_roles) rather than a parallel implementation —
+# every checkin coming through here automatically gets the same
+# milestone-role logic, personal-best tracking, and catch-up-checkin
+# flagging that a manual /checkin gets. It's a different door into the
+# same house, not a second house.
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "bot_ready": bot.is_ready()})
+
+
+async def handle_roblox_checkin(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "request body must be valid JSON"}, status=400)
+
+    guild_id_raw = payload.get("guild_id")
+    roblox_user_id = payload.get("roblox_user_id")
+    xp = payload.get("xp")
+
+    if not guild_id_raw or not roblox_user_id or xp is None:
+        return web.json_response(
+            {"error": "guild_id, roblox_user_id, and xp are all required"}, status=400,
+        )
+    try:
+        guild_id_int = int(guild_id_raw)
+    except (TypeError, ValueError):
+        return web.json_response({"error": "guild_id must be a Discord server ID (a number)"}, status=400)
+    try:
+        xp = int(xp)
+    except (TypeError, ValueError):
+        return web.json_response({"error": "xp must be a whole number"}, status=400)
+    if xp < 0:
+        return web.json_response({"error": "xp cannot be negative"}, status=400)
+    roblox_user_id = str(roblox_user_id).strip()
+
+    guild = bot.get_guild(guild_id_int)
+    if guild is None:
+        return web.json_response({"error": "bot is not in a server with that guild_id"}, status=404)
+
+    data = load_data()
+    guild_data = get_guild(data, guild_id_int)
+    discord_id = guild_data.get("roblox_links", {}).get(roblox_user_id)
+    if discord_id is None:
+        return web.json_response(
+            {"error": "this Roblox account isn't linked to anyone in this server — admin needs to run /syncbloxlink"},
+            status=404,
+        )
+
+    # No rate-cap check here, deliberately — the XP rate cap (/setxpratecap)
+    # exists to catch a human typing an inflated number into /checkin. Data
+    # arriving through this API comes from the game's own server-side
+    # state, a fundamentally different trust level, same reasoning as why
+    # an admin manually running /checkin on someone else's behalf already
+    # bypasses the cap.
+    entry = guild_data["users"].get(discord_id)
+    if entry is None:
+        entry = create_user(guild_data, int(discord_id), xp, source="roblox_api")
+    else:
+        record_checkin(entry, xp, source="roblox_api")
+    save_data(data)
+
+    role_result = {"added": [], "removed": []}
+    member = guild.get_member(int(discord_id))
+    if member is not None:
+        role_result = await apply_xp_roles(guild, member, guild_data, entry["current_xp"])
+
+    return web.json_response({
+        "status": "ok",
+        "current_xp": entry["current_xp"],
+        "roles_added": [r.name for r in role_result["added"]],
+        "roles_removed": [r.name for r in role_result["removed"]],
+    })
+
+
+async def start_api_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    app.router.add_post("/api/roblox/checkin", handle_roblox_checkin)
+
+    port = int(os.environ.get("API_PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(
+        f"⚠️  Roblox API listening on 0.0.0.0:{port} — NO AUTHENTICATION IS CONFIGURED. This is a known, "
+        f"temporary, insecure state. Do not point the real game at this or expose it publicly yet."
+    )
 
 
 if __name__ == "__main__":
@@ -7001,4 +7248,17 @@ if __name__ == "__main__":
         raise SystemExit(
             "No DISCORD_TOKEN found. Set it as an environment variable or in a .env file."
         )
-    bot.run(token)
+
+    async def main():
+        # Runs the Discord gateway connection and the HTTP API in the same
+        # process and event loop — bot.start() (the non-blocking form of
+        # bot.run()) alongside the web server, rather than one blocking
+        # the other. If either one raises, gather propagates it and the
+        # process exits rather than limping along with only half running.
+        async with bot:
+            await asyncio.gather(
+                bot.start(token),
+                start_api_server(),
+            )
+
+    asyncio.run(main())

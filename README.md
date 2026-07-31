@@ -85,6 +85,8 @@ weekly requirement (default: 20,000 XP/week).
 | `/hide user: enabled:` | Admin | Hides/unhides a member from `/weeklyleaderboard` and `/totalleaderboard` — still fully counted in `/crewtotals`, `/crewlevel`, and their own `/status`/`/profile`. Hiding is about not being *listed*, not about being untracked. |
 | `/ignorerequirement user: enabled:` | Admin | Exempts a member (e.g. an admin or mod) from ever being flagged as behind pace — always shows as on-track, skipped by both inactivity ping buckets and `/pingbehindpace`. Their real XP is still tracked and shown everywhere normally. Independent of `/hide` — combine both if needed. |
 | `/setlift lift: weight: [user]` | Everyone (own); Admin for others | Records a deadlift/bench/squat number — shows as a badge on `/profile`. |
+| `/setbloxlinkkey api_key:` | Admin | Sets this server's Bloxlink Guild API Key, used to resolve verified Roblox↔Discord links. See "Roblox auto-tracking" below. |
+| `/syncbloxlink` | Admin | Resolves Roblox links for every server member already verified with Bloxlink — no action needed from members who've verified before, in this server or any other. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
 | `/togglerecentrate enabled:<true/false>` | Admin | Show or hide the "Recent Rate" field server-wide. See note below. |
 | `/togglecompactleaderboard enabled:<true/false>` | Admin | Switch `/weeklyleaderboard` and `/totalleaderboard` between full-detail and compact one-line-per-person entries. |
@@ -253,6 +255,28 @@ The bot can automatically assign a Discord role once someone's total XP crosses 
 - Roles are re-evaluated **on that person's next checkin** — not instantly for everyone the moment you change a setting. If you update the bot, add a bunch of thresholds, or import a big batch of members, some people might carry outdated role combinations until they check in again. Run `/syncxproles` (or the panel's "Sync XP Roles Now") to force a full re-check of everyone immediately instead of waiting.
 - Roles are checked on `/checkin` and `/importxp` — the two places XP actually gets recorded.
 - `/listxproles` marks each configured role 🪜 ladder or 🔒 sticky so you can see the setup at a glance.
+
+## Roblox auto-tracking (early, in progress)
+
+```
+/setbloxlinkkey api_key:<your server's Bloxlink Guild API Key>
+/syncbloxlink
+```
+
+The bot can receive XP updates automatically from the Roblox game itself, via `POST /api/roblox/checkin`, instead of relying only on someone typing `/checkin`. This reuses the exact same internal functions a manual checkin uses — milestone roles, personal bests, catch-up-checkin flagging, all of it — so an automated checkin behaves identically to a manual one in every way except *how* the XP number arrived.
+
+**Getting a Roblox account linked to a Discord one is the hard part, not the HTTP plumbing** — the bot needs some proof a given Roblox account actually belongs to a given Discord member, or anyone could spoof anyone else's data. Rather than build a custom verification flow, this uses **[Bloxlink](https://blox.link)**, the most widely used Roblox↔Discord verification service, as the source of truth:
+
+1. Generate a **Guild API Key** from Bloxlink's own dashboard for this server (requires Bloxlink to be added to the server).
+2. `/setbloxlinkkey` to store it.
+3. `/syncbloxlink` to resolve every current server member who's already Bloxlink-verified — including people who verified in a *different* server at some point, since Bloxlink's verification is global. This is genuinely "no action needed" for anyone already verified anywhere, not just in this server.
+4. Anyone not yet verified needs to actually verify with Bloxlink (bio code or in-game, Bloxlink's own flow) before a sync will find them — there's no way around proving ownership somehow, by design.
+
+**Rate limits shape the design:** Bloxlink's free tier is 500 lookups/day, which is comfortable for a one-time sync but wouldn't be for looking someone up on every single XP update. So `/syncbloxlink` resolves everyone *once* into the bot's own storage, and the actual tracking endpoint reads that stored mapping — fast, and still works even if Bloxlink has downtime at the moment someone checks in.
+
+**⚠️ Current state — two things not yet true:**
+- **The `/api/roblox/checkin` endpoint has no authentication.** Anyone who can reach it can currently write XP for any linked player in any server the bot is in. Don't point a real, live Roblox game at it yet.
+- **Bloxlink's `discord-to-roblox` lookup direction (used by `/syncbloxlink`) is inferred by symmetry with their confirmed `roblox-to-discord` API, not independently tested against a real key.** If `/syncbloxlink` reports unexpected errors, that's most likely this exact assumption needing a small adjustment — the error messages include the raw response specifically so that's diagnosable quickly rather than a mystery.
 
 ## XP rate cap
 
