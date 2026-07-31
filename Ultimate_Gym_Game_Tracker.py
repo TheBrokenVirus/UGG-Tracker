@@ -20,6 +20,8 @@ import colorsys
 import asyncio
 from aiohttp import web, ClientSession
 import gc
+import secrets
+import hmac
 from pathlib import Path
 from typing import Optional, Literal
 from datetime import datetime, timedelta, timezone
@@ -185,6 +187,7 @@ def default_guild_data() -> dict:
         "roblox_links": {},
         "bloxlink_api_key": None,
         "bloxlink_verified_role_id": None,
+        "tracking_api_key": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -690,6 +693,28 @@ def get_week_activity_days(entry: dict) -> list:
         if 0 <= day_index < 7:
             days[day_index] = True
     return days
+
+def resolve_guild_from_tracking_key(data: dict, submitted_key: str) -> Optional[str]:
+    """Given a raw API key from an incoming /api/roblox/checkin request,
+    finds which guild it belongs to — or None if it doesn't match any
+    server's key. This is the actual authentication: the key alone
+    determines identity, nothing from the request body is trusted for
+    that purpose (a request no longer even needs to say which guild it's
+    for; the key already says so).
+
+    Uses hmac.compare_digest rather than == for each comparison —
+    constant-time, so response timing can't be used to guess a correct
+    key one byte at a time. A linear scan over all guilds is fine here:
+    the guild count for one bot is small (tens to hundreds, not millions),
+    and it avoids maintaining a separate cached index that could go
+    stale relative to xp_data.json."""
+    if not submitted_key:
+        return None
+    for guild_id, guild_data in data.get("guilds", {}).items():
+        stored_key = guild_data.get("tracking_api_key")
+        if stored_key and hmac.compare_digest(stored_key, submitted_key):
+            return guild_id
+    return None
 
 async def bloxlink_discord_to_roblox(guild_id: int, discord_user_id: int, api_key: str) -> Optional[str]:
     """Resolves a Discord user's verified Roblox ID via Bloxlink's public
@@ -2686,18 +2711,28 @@ class ConfirmRestoreView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         data = load_data()
         normalized = normalize_guild_data(self.restored_guild_data)
-        # The backup's Bloxlink key is a redacted placeholder, not a real
-        # key (see /backup) — restoring shouldn't stomp a currently-live
-        # key with that placeholder text. Whatever's live now wins.
+        # Redacted keys in the backup (see /backup) are placeholders, not
+        # real values — restoring shouldn't stomp a currently-live key
+        # with placeholder text. Whatever's live now wins, for both keys.
+        existing_guild_data = data.get("guilds", {}).get(str(self.guild_id), {})
+        needs_bloxlink_key = False
+        needs_tracking_key = False
         if str(normalized.get("bloxlink_api_key", "")).startswith("<redacted"):
-            existing_guild_data = data.get("guilds", {}).get(str(self.guild_id), {})
             normalized["bloxlink_api_key"] = existing_guild_data.get("bloxlink_api_key")
+            needs_bloxlink_key = normalized["bloxlink_api_key"] is None
+        if str(normalized.get("tracking_api_key", "")).startswith("<redacted"):
+            normalized["tracking_api_key"] = existing_guild_data.get("tracking_api_key")
+            needs_tracking_key = normalized["tracking_api_key"] is None
         data["guilds"][str(self.guild_id)] = normalized
         save_data(data)
         for child in self.children:
             child.disabled = True
-        needs_key = normalized.get("bloxlink_api_key") is None and str(self.restored_guild_data.get("bloxlink_api_key", "")).startswith("<redacted")
-        note = " Run `/setbloxlinkkey` again — your Bloxlink key was redacted from the backup and wasn't live to restore." if needs_key else ""
+        notes = []
+        if needs_bloxlink_key:
+            notes.append("Run `/setbloxlinkkey` again — your Bloxlink key was redacted from the backup and wasn't live to restore.")
+        if needs_tracking_key:
+            notes.append("Run `/generatetrackingkey` again — your Roblox tracking key was redacted from the backup and wasn't live to restore.")
+        note = (" " + " ".join(notes)) if notes else ""
         await interaction.response.edit_message(
             content=f"✅ Backup restored — {len(normalized['users'])} tracked user(s), all settings replaced.{note}",
             view=self,
@@ -5237,6 +5272,64 @@ async def clearbloxlinkrole(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="generatetrackingkey",
+    description="[Admin] Generate this server's key for the Roblox auto-tracking API",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def generatetrackingkey(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    had_key_before = bool(guild_data.get("tracking_api_key"))
+
+    new_key = secrets.token_urlsafe(32)
+    guild_data["tracking_api_key"] = new_key
+    save_data(data)
+
+    # Deliberately NOT logging the key itself — same reasoning as
+    # /setbloxlinkkey. Only that an action happened, never the secret.
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user,
+        "Regenerated tracking API key" if had_key_before else "Generated tracking API key",
+    )
+
+    warning = (
+        "\n\n⚠️ This **replaces** your previous key — anything using the old one (e.g. an already-configured "
+        "Roblox game) will stop working until it's updated with this new one." if had_key_before else ""
+    )
+    await interaction.response.send_message(
+        f"**Your server's Roblox tracking API key:**\n```\n{new_key}\n```\n"
+        f"This is shown **once** — copy it now. Put it in your Roblox game's server-side script as the "
+        f"`Authorization` header on requests to `/api/roblox/checkin`. Anyone with this key can submit XP "
+        f"for any player linked in this server, so treat it like a password — don't share it outside your "
+        f"own game's code. If it's ever exposed, run this command again to issue a new one; the old one "
+        f"stops working immediately.{warning}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="revoketrackingkey",
+    description="[Admin] Disable the Roblox auto-tracking API for this server immediately",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def revoketrackingkey(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    if not guild_data.get("tracking_api_key"):
+        await interaction.response.send_message("No tracking key is set for this server — nothing to revoke.", ephemeral=True)
+        return
+
+    guild_data["tracking_api_key"] = None
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Revoked tracking API key")
+    await interaction.response.send_message(
+        "Tracking API key revoked — any request using the old key will now be rejected immediately. "
+        "Run `/generatetrackingkey` to issue a new one.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="syncbloxlink",
     description="[Admin] Resolve Roblox links for server members already verified with Bloxlink",
 )
@@ -5905,12 +5998,14 @@ async def backup_cmd(interaction: discord.Interaction):
     # meant to be saved, moved between machines, maybe shared with another
     # admin. That's exactly the kind of file a live API key shouldn't sit
     # in plaintext inside, even though this command is already admin-only
-    # and Premium-gated. /restore leaves this field alone if it's the
+    # and Premium-gated. /restore leaves these fields alone if they're the
     # redacted placeholder rather than a real key, so restoring a backup
     # never silently wipes out a key that was set after the backup was made.
     export_guild_data = dict(guild_data)
     if export_guild_data.get("bloxlink_api_key"):
         export_guild_data["bloxlink_api_key"] = "<redacted — re-run /setbloxlinkkey after restoring>"
+    if export_guild_data.get("tracking_api_key"):
+        export_guild_data["tracking_api_key"] = "<redacted — re-run /generatetrackingkey after restoring>"
 
     payload = {
         "backup_version": 1,
@@ -5929,8 +6024,9 @@ async def backup_cmd(interaction: discord.Interaction):
             f"(requirement, week sync, XP roles, channels, toggles). This is different from "
             f"`/exportdata`, which only exports current stats, not settings. Keep this file "
             f"somewhere safe; `/restore` can rebuild everything from it. "
-            f"Note: your Bloxlink API key is redacted from this file for safety — you'll need to "
-            f"run `/setbloxlinkkey` again after a restore if you had one set."
+            f"Note: your Bloxlink and Roblox-tracking API keys are redacted from this file for safety — "
+            f"you'll need to run `/setbloxlinkkey` and/or `/generatetrackingkey` again after a restore "
+            f"if you had them set."
         ),
         file=discord.File(fp=json_bytes, filename=filename),
         ephemeral=True,
@@ -7223,6 +7319,8 @@ hide.error(_perm_or_premium_error)
 ignorerequirement.error(_perm_or_premium_error)
 setlift.error(_channel_error)
 setbloxlinkkey.error(_perm_error)
+generatetrackingkey.error(_perm_error)
+revoketrackingkey.error(_perm_error)
 setbloxlinkrole.error(_perm_error)
 clearbloxlinkrole.error(_perm_error)
 syncbloxlink.error(_perm_error)
@@ -7233,20 +7331,12 @@ removeallusers.error(_perm_error)
 # Roblox HTTP API (for automatic in-game XP tracking)
 # ---------------------------------------------------------------------------
 #
-# ⚠️  SECURITY: THERE IS NO AUTHENTICATION ON THIS ENDPOINT YET.
-# Anyone who can reach this URL can write arbitrary XP for any linked
-# player in any server the bot is in, simply by supplying that server's
-# guild_id directly in the request body — nothing currently verifies the
-# request actually came from that server's real Roblox game. This is a
-# deliberate, temporary state: an api-key -> guild_id mapping (checked
-# before anything else runs) is the planned next step, not yet built.
-#
-# DO NOT point a real, live Roblox game at this endpoint, and DO NOT
-# expose this port to the public internet, until that's in place. This
-# exists right now purely so the networking/binding piece (see Discloud's
-# TYPE=site + port 8080 + host 0.0.0.0 requirements) can be tested
-# end to end, and so the request/response shape is settled before auth
-# gets layered on top of it.
+# Authenticated via a per-server key (see /generatetrackingkey), sent as
+# the Authorization header. The key alone determines which server a
+# request is for — see resolve_guild_from_tracking_key — so a request no
+# longer needs to (or is allowed to) say which guild it's for; trusting a
+# caller-supplied guild_id was the actual vulnerability in the original
+# no-auth version, not just the missing key check.
 #
 # Reuses the exact same functions /checkin already uses (create_user,
 # record_checkin, apply_xp_roles) rather than a parallel implementation —
@@ -7255,41 +7345,55 @@ removeallusers.error(_perm_error)
 # flagging that a manual /checkin gets. It's a different door into the
 # same house, not a second house.
 
+MAX_API_CHECKIN_XP = 10_000_000  # sanity ceiling — see handle_roblox_checkin
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "bot_ready": bot.is_ready()})
 
 
 async def handle_roblox_checkin(request: web.Request) -> web.Response:
+    submitted_key = request.headers.get("Authorization", "").strip()
+    if not submitted_key:
+        return web.json_response({"error": "missing Authorization header"}, status=401)
+
+    data = load_data()
+    guild_id_str = resolve_guild_from_tracking_key(data, submitted_key)
+    if guild_id_str is None:
+        return web.json_response({"error": "invalid API key"}, status=401)
+    guild_id_int = int(guild_id_str)
+
     try:
         payload = await request.json()
     except Exception:
         return web.json_response({"error": "request body must be valid JSON"}, status=400)
 
-    guild_id_raw = payload.get("guild_id")
     roblox_user_id = payload.get("roblox_user_id")
     xp = payload.get("xp")
-
-    if not guild_id_raw or not roblox_user_id or xp is None:
-        return web.json_response(
-            {"error": "guild_id, roblox_user_id, and xp are all required"}, status=400,
-        )
-    try:
-        guild_id_int = int(guild_id_raw)
-    except (TypeError, ValueError):
-        return web.json_response({"error": "guild_id must be a Discord server ID (a number)"}, status=400)
+    if not roblox_user_id or xp is None:
+        return web.json_response({"error": "roblox_user_id and xp are both required"}, status=400)
     try:
         xp = int(xp)
     except (TypeError, ValueError):
         return web.json_response({"error": "xp must be a whole number"}, status=400)
     if xp < 0:
         return web.json_response({"error": "xp cannot be negative"}, status=400)
+    if xp > MAX_API_CHECKIN_XP:
+        # A valid key doesn't mean a valid NUMBER — this catches a bug on
+        # the game's own end (a miscalculation, a bad multiplier, garbage
+        # data) from silently becoming someone's real recorded XP.
+        # Deliberately generous, not a real rate cap (that's what
+        # /setxpratecap is for, and it doesn't apply here on purpose —
+        # see below) — just a ceiling against an obviously-wrong number.
+        return web.json_response(
+            {"error": f"xp exceeds the sanity ceiling ({MAX_API_CHECKIN_XP:,}) — rejected, nothing recorded"},
+            status=400,
+        )
     roblox_user_id = str(roblox_user_id).strip()
 
     guild = bot.get_guild(guild_id_int)
     if guild is None:
-        return web.json_response({"error": "bot is not in a server with that guild_id"}, status=404)
+        return web.json_response({"error": "bot is not currently in this server"}, status=404)
 
-    data = load_data()
     guild_data = get_guild(data, guild_id_int)
     discord_id = guild_data.get("roblox_links", {}).get(roblox_user_id)
     if discord_id is None:
@@ -7303,7 +7407,8 @@ async def handle_roblox_checkin(request: web.Request) -> web.Response:
     # arriving through this API comes from the game's own server-side
     # state, a fundamentally different trust level, same reasoning as why
     # an admin manually running /checkin on someone else's behalf already
-    # bypasses the cap.
+    # bypasses the cap. The sanity ceiling above is a separate, much
+    # coarser safeguard against a bug rather than dishonesty.
     entry = guild_data["users"].get(discord_id)
     if entry is None:
         entry = create_user(guild_data, int(discord_id), xp, source="roblox_api")

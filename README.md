@@ -87,6 +87,8 @@ weekly requirement (default: 20,000 XP/week).
 | `/setlift lift: weight: [user]` | Everyone (own); Admin for others | Records a deadlift/bench/squat number — shows as a badge on `/profile`. |
 | `/setbloxlinkkey api_key:` | Admin | Sets this server's Bloxlink Guild API Key, used to resolve verified Roblox↔Discord links. See "Roblox auto-tracking" below. |
 | `/syncbloxlink` | Admin | Resolves Roblox links for every server member already verified with Bloxlink — no action needed from members who've verified before, in this server or any other. Also assigns the configured verified role, if one's set (see below). |
+| `/generatetrackingkey` | Admin | Generates (or regenerates) this server's key for the Roblox auto-tracking API. Shown once — required before the game can send real XP data. |
+| `/revoketrackingkey` | Admin | Immediately disables the Roblox auto-tracking API for this server. |
 | `/setbloxlinkrole role:` | Admin | Sets a role `/syncbloxlink` auto-assigns to anyone it links — including people already linked in a previous sync, if they don't have the role yet. |
 | `/clearbloxlinkrole` | Admin | Stops `/syncbloxlink` from assigning a role. Doesn't remove it from anyone who already has it. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
@@ -278,8 +280,18 @@ The bot can receive XP updates automatically from the Roblox game itself, via `P
 
 **Rate limits shape the design:** Bloxlink's free tier is 500 lookups/day, which is comfortable for a one-time sync but wouldn't be for looking someone up on every single XP update. So `/syncbloxlink` resolves everyone *once* into the bot's own storage, and the actual tracking endpoint reads that stored mapping — fast, and still works even if Bloxlink has downtime at the moment someone checks in.
 
-**⚠️ Current state — two things not yet true:**
-- **The `/api/roblox/checkin` endpoint has no authentication.** Anyone who can reach it can currently write XP for any linked player in any server the bot is in. Don't point a real, live Roblox game at it yet.
+**Authentication — how to actually set it up:**
+
+```
+/generatetrackingkey
+```
+
+Run this once, then put the key it shows you into your Roblox game's server-side script as the `Authorization` header on every request to `/api/roblox/checkin`. It's shown exactly once — there's no way to view it again later, only regenerate a new one (which immediately invalidates the old one, so update the game's script at the same time). `/revoketrackingkey` disables the API for this server immediately without issuing a replacement.
+
+The key is what determines *which server* a request is for — the request body no longer includes or trusts a `guild_id` at all, which closes off the actual vulnerability the earlier no-auth version had (a spoofed `guild_id` could otherwise target any server the bot's in, regardless of who was making the request).
+
+**Still worth knowing:**
+- **Every incoming XP value is checked against a generous sanity ceiling** (10,000,000) before being recorded, rejected outright if it's exceeded. This is deliberately not the same thing as `/setxpratecap` — that cap doesn't apply to API-sourced checkins at all (the game's own server state is trusted differently than a human typing a number), this ceiling exists purely to catch an obvious bug on the game's end from becoming someone's real recorded XP.
 - **Bloxlink's `discord-to-roblox` lookup direction (used by `/syncbloxlink`) is inferred by symmetry with their confirmed `roblox-to-discord` API, not independently tested against a real key.** If `/syncbloxlink` reports unexpected errors, that's most likely this exact assumption needing a small adjustment — the error messages include the raw response specifically so that's diagnosable quickly rather than a mystery.
 
 ## XP rate cap
