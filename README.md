@@ -86,7 +86,9 @@ weekly requirement (default: 20,000 XP/week).
 | `/ignorerequirement user: enabled:` | Admin | Exempts a member (e.g. an admin or mod) from ever being flagged as behind pace — always shows as on-track, skipped by both inactivity ping buckets and `/pingbehindpace`. Their real XP is still tracked and shown everywhere normally. Independent of `/hide` — combine both if needed. |
 | `/setlift lift: weight: [user]` | Everyone (own); Admin for others | Records a deadlift/bench/squat number — shows as a badge on `/profile`. |
 | `/setbloxlinkkey api_key:` | Admin | Sets this server's Bloxlink Guild API Key, used to resolve verified Roblox↔Discord links. See "Roblox auto-tracking" below. |
-| `/syncbloxlink` | Admin | Resolves Roblox links for every server member already verified with Bloxlink — no action needed from members who've verified before, in this server or any other. |
+| `/syncbloxlink` | Admin | Resolves Roblox links for every server member already verified with Bloxlink — no action needed from members who've verified before, in this server or any other. Also assigns the configured verified role, if one's set (see below). |
+| `/setbloxlinkrole role:` | Admin | Sets a role `/syncbloxlink` auto-assigns to anyone it links — including people already linked in a previous sync, if they don't have the role yet. |
+| `/clearbloxlinkrole` | Admin | Stops `/syncbloxlink` from assigning a role. Doesn't remove it from anyone who already has it. |
 | `/setrequirement xp:<number>` | Admin (Manage Server) | Change the weekly XP goal (default 20,000). |
 | `/togglerecentrate enabled:<true/false>` | Admin | Show or hide the "Recent Rate" field server-wide. See note below. |
 | `/togglecompactleaderboard enabled:<true/false>` | Admin | Switch `/weeklyleaderboard` and `/totalleaderboard` between full-detail and compact one-line-per-person entries. |
@@ -270,6 +272,8 @@ The bot can receive XP updates automatically from the Roblox game itself, via `P
 1. Generate a **Guild API Key** from Bloxlink's own dashboard for this server (requires Bloxlink to be added to the server).
 2. `/setbloxlinkkey` to store it.
 3. `/syncbloxlink` to resolve every current server member who's already Bloxlink-verified — including people who verified in a *different* server at some point, since Bloxlink's verification is global. This is genuinely "no action needed" for anyone already verified anywhere, not just in this server.
+
+**Optional: `/setbloxlinkrole`** to have `/syncbloxlink` auto-assign a role to anyone it successfully links — a visible "Verified" badge without touching anything else. Re-running `/syncbloxlink` after setting the role also catches anyone linked in an earlier sync who doesn't have it yet, not just new links from that run.
 4. Anyone not yet verified needs to actually verify with Bloxlink (bio code or in-game, Bloxlink's own flow) before a sync will find them — there's no way around proving ownership somehow, by design.
 
 **Rate limits shape the design:** Bloxlink's free tier is 500 lookups/day, which is comfortable for a one-time sync but wouldn't be for looking someone up on every single XP update. So `/syncbloxlink` resolves everyone *once* into the bot's own storage, and the actual tracking endpoint reads that stored mapping — fast, and still works even if Bloxlink has downtime at the moment someone checks in.

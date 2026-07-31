@@ -184,6 +184,7 @@ def default_guild_data() -> dict:
         "default_card_color2": None,
         "roblox_links": {},
         "bloxlink_api_key": None,
+        "bloxlink_verified_role_id": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -2685,12 +2686,20 @@ class ConfirmRestoreView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         data = load_data()
         normalized = normalize_guild_data(self.restored_guild_data)
+        # The backup's Bloxlink key is a redacted placeholder, not a real
+        # key (see /backup) — restoring shouldn't stomp a currently-live
+        # key with that placeholder text. Whatever's live now wins.
+        if str(normalized.get("bloxlink_api_key", "")).startswith("<redacted"):
+            existing_guild_data = data.get("guilds", {}).get(str(self.guild_id), {})
+            normalized["bloxlink_api_key"] = existing_guild_data.get("bloxlink_api_key")
         data["guilds"][str(self.guild_id)] = normalized
         save_data(data)
         for child in self.children:
             child.disabled = True
+        needs_key = normalized.get("bloxlink_api_key") is None and str(self.restored_guild_data.get("bloxlink_api_key", "")).startswith("<redacted")
+        note = " Run `/setbloxlinkkey` again — your Bloxlink key was redacted from the backup and wasn't live to restore." if needs_key else ""
         await interaction.response.edit_message(
-            content=f"✅ Backup restored — {len(normalized['users'])} tracked user(s), all settings replaced.",
+            content=f"✅ Backup restored — {len(normalized['users'])} tracked user(s), all settings replaced.{note}",
             view=self,
         )
         await log_admin_action(
@@ -2950,6 +2959,12 @@ HELP_CATEGORIES = [
         ("/removebannertier role:<@role>", "Remove a role's banner tier"),
         ("/listbannertiers", "Show all configured banner tiers"),
         ("/setbasecard mode: color1: [color2]", "Set the server's default look for everyone else"),
+    ]),
+    ("admin_bloxlink", "Admin: Bloxlink / Roblox Linking", "🔗", "Resolving verified Roblox links, for automatic XP tracking", [
+        ("/setbloxlinkkey api_key:", "Set this server's Bloxlink Guild API Key"),
+        ("/syncbloxlink", "Resolve links for everyone already Bloxlink-verified"),
+        ("/setbloxlinkrole role:<@role>", "Auto-assign a role to anyone /syncbloxlink links"),
+        ("/clearbloxlinkrole", "Stop auto-assigning a verified role"),
     ]),
     ("admin_skus", "Admin: SKU Role Automation", "🛒", "Auto-granting roles for Discord purchases/subscriptions", [
         ("/addskurole sku_id: role: name:", "Auto-grant a role while a SKU entitlement is active"),
@@ -5176,6 +5191,52 @@ async def setbloxlinkkey(interaction: discord.Interaction, api_key: str):
 
 
 @bot.tree.command(
+    name="setbloxlinkrole",
+    description="[Admin] Set a role /syncbloxlink assigns to anyone it successfully links",
+)
+@app_commands.describe(role="Role to assign to Bloxlink-verified members")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setbloxlinkrole(interaction: discord.Interaction, role: discord.Role):
+    bot_member = interaction.guild.me
+    if not bot_member.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "⚠️ I don't have the **Manage Roles** permission in this server yet — `/syncbloxlink` won't be "
+            "able to assign this role until that's granted.", ephemeral=True,
+        )
+        return
+    if role >= bot_member.top_role:
+        await interaction.response.send_message(
+            f"⚠️ My role needs to be **above** {role.mention} in Server Settings → Roles for me to be able "
+            f"to assign it. Right now it's at or above my own highest role.", ephemeral=True,
+        )
+        return
+
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["bloxlink_verified_role_id"] = role.id
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Set Bloxlink verified role", target=role.mention)
+    await interaction.response.send_message(
+        f"{role.mention} will now be assigned to anyone `/syncbloxlink` successfully links — including "
+        f"people it already linked in a previous sync, if they don't have the role yet. Run `/syncbloxlink` "
+        f"again to apply it to everyone already linked.",
+    )
+
+
+@bot.tree.command(name="clearbloxlinkrole", description="[Admin] Stop /syncbloxlink from assigning a verified role")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clearbloxlinkrole(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["bloxlink_verified_role_id"] = None
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Cleared Bloxlink verified role")
+    await interaction.response.send_message(
+        "`/syncbloxlink` will no longer assign a role — existing role assignments from before aren't removed."
+    )
+
+
+@bot.tree.command(
     name="syncbloxlink",
     description="[Admin] Resolve Roblox links for server members already verified with Bloxlink",
 )
@@ -5192,16 +5253,33 @@ async def syncbloxlink(interaction: discord.Interaction):
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    linked, already_linked, not_verified, errored = 0, 0, 0, 0
+    verified_role = None
+    role_id = guild_data.get("bloxlink_verified_role_id")
+    if role_id:
+        verified_role = interaction.guild.get_role(role_id)
+        # A configured role that no longer exists (deleted since) shouldn't
+        # silently do nothing — surfaced in the summary below, not here.
+
+    linked, already_linked, not_verified, errored, roles_assigned = 0, 0, 0, 0, 0
     error_examples = []
     roblox_links = guild_data.setdefault("roblox_links", {})
     existing_discord_ids = set(roblox_links.values())
+
+    async def maybe_assign_role(member: discord.Member) -> None:
+        nonlocal roles_assigned
+        if verified_role is not None and verified_role not in member.roles:
+            try:
+                await member.add_roles(verified_role, reason="Bloxlink verified (/syncbloxlink)")
+                roles_assigned += 1
+            except discord.HTTPException:
+                pass  # permissions/hierarchy issue — doesn't stop the rest of the sync
 
     for member in interaction.guild.members:
         if member.bot:
             continue
         if str(member.id) in existing_discord_ids:
             already_linked += 1
+            await maybe_assign_role(member)  # covers the role being set up after their original sync
             continue
         try:
             roblox_id = await bloxlink_discord_to_roblox(interaction.guild_id, member.id, api_key)
@@ -5216,11 +5294,13 @@ async def syncbloxlink(interaction: discord.Interaction):
         roblox_links[roblox_id] = str(member.id)
         existing_discord_ids.add(str(member.id))
         linked += 1
+        await maybe_assign_role(member)
 
     save_data(data)
     await log_admin_action(
         interaction.guild, guild_data, interaction.user, "Synced Bloxlink links",
-        details=f"{linked} newly linked, {already_linked} already linked, {not_verified} not verified, {errored} errors.",
+        details=f"{linked} newly linked, {already_linked} already linked, {not_verified} not verified, "
+                f"{errored} errors, {roles_assigned} roles assigned.",
     )
 
     summary = (
@@ -5229,6 +5309,10 @@ async def syncbloxlink(interaction: discord.Interaction):
         f"↩️ {already_linked} already linked from a previous sync\n"
         f"❌ {not_verified} not verified with Bloxlink yet\n"
     )
+    if role_id and verified_role is None:
+        summary += "⚠️ A verified role is configured but no longer exists — run `/setbloxlinkrole` again to pick a new one.\n"
+    elif verified_role is not None:
+        summary += f"🏷️ {roles_assigned} member(s) given {verified_role.mention}\n"
     if errored:
         summary += f"⚠️ {errored} lookups failed unexpectedly — this usually means the API response shape didn't match what was expected, worth reporting.\n"
         for ex in error_examples:
@@ -5817,12 +5901,23 @@ async def backup_cmd(interaction: discord.Interaction):
     guild_data = get_guild(data, interaction.guild_id)
     save_data(data)  # persist any lazy guild creation
 
+    # Redact secrets before they go into a downloadable file — a backup is
+    # meant to be saved, moved between machines, maybe shared with another
+    # admin. That's exactly the kind of file a live API key shouldn't sit
+    # in plaintext inside, even though this command is already admin-only
+    # and Premium-gated. /restore leaves this field alone if it's the
+    # redacted placeholder rather than a real key, so restoring a backup
+    # never silently wipes out a key that was set after the backup was made.
+    export_guild_data = dict(guild_data)
+    if export_guild_data.get("bloxlink_api_key"):
+        export_guild_data["bloxlink_api_key"] = "<redacted — re-run /setbloxlinkkey after restoring>"
+
     payload = {
         "backup_version": 1,
         "backup_time": iso(utcnow()),
         "guild_id": interaction.guild_id,
         "guild_name": interaction.guild.name,
-        "guild_data": guild_data,
+        "guild_data": export_guild_data,
     }
     json_bytes = io.BytesIO(json.dumps(payload, indent=2).encode("utf-8"))
     timestamp = utcnow().strftime("%Y%m%d_%H%M%S")
@@ -5833,7 +5928,9 @@ async def backup_cmd(interaction: discord.Interaction):
             f"Full backup — **{len(guild_data['users'])}** tracked user(s), plus every setting "
             f"(requirement, week sync, XP roles, channels, toggles). This is different from "
             f"`/exportdata`, which only exports current stats, not settings. Keep this file "
-            f"somewhere safe; `/restore` can rebuild everything from it."
+            f"somewhere safe; `/restore` can rebuild everything from it. "
+            f"Note: your Bloxlink API key is redacted from this file for safety — you'll need to "
+            f"run `/setbloxlinkkey` again after a restore if you had one set."
         ),
         file=discord.File(fp=json_bytes, filename=filename),
         ephemeral=True,
@@ -7126,6 +7223,8 @@ hide.error(_perm_or_premium_error)
 ignorerequirement.error(_perm_or_premium_error)
 setlift.error(_channel_error)
 setbloxlinkkey.error(_perm_error)
+setbloxlinkrole.error(_perm_error)
+clearbloxlinkrole.error(_perm_error)
 syncbloxlink.error(_perm_error)
 removeallusers.error(_perm_error)
 
