@@ -694,6 +694,17 @@ def get_lifts(entry: dict) -> dict:
     lifts = entry.get("lifts", {})
     return {"deadlift": lifts.get("deadlift"), "bench": lifts.get("bench"), "squat": lifts.get("squat")}
 
+def is_requirement_exempt(entry: dict) -> bool:
+    """Backward-compatible getter — see /ignorerequirement. Exempts a
+    member (e.g. an admin or mod) from being flagged as behind pace: their
+    real XP and checkins are still tracked and shown normally everywhere,
+    but compute_stats always reports them as on_track, and both inactivity
+    ping buckets (zero-checkins and behind-pace) and /pingbehindpace skip
+    them entirely. Distinct from /hide, which controls leaderboard
+    visibility, not requirement pressure — the two are independent and
+    can be combined."""
+    return entry.get("requirement_exempt", False)
+
 def is_hidden_from_leaderboard(entry: dict) -> bool:
     """Backward-compatible getter — see /hide. Only affects
     /weeklyleaderboard and /totalleaderboard; someone hidden this way is
@@ -987,6 +998,9 @@ def compute_stats(entry: dict, requirement: int, prorate_threshold_hours: float 
     else:
         required_rate_per_day = float("inf") if remaining_needed > 0 else 0
     on_track = projected_total >= effective_requirement
+    exempt = is_requirement_exempt(entry)
+    if exempt:
+        on_track = True  # never flagged as behind pace — see is_requirement_exempt
 
     MIN_INTERVAL_HOURS = 1 / 6  # 10 minutes — below this, extrapolating to an hourly rate is too noisy to trust
     recent_rate_per_hour = None
@@ -1014,6 +1028,7 @@ def compute_stats(entry: dict, requirement: int, prorate_threshold_hours: float 
         "checkins_this_week": checkins_this_week,
         "is_prorated": is_prorated,
         "effective_requirement": effective_requirement,
+        "requirement_exempt": exempt,
     }
 
 # ---------------------------------------------------------------------------
@@ -2864,6 +2879,7 @@ HELP_CATEGORIES = [
     ("admin_users", "Admin: Users & Data", "👤", "Correcting, resetting, importing, exporting", [
         ("/setbaseline user: starting_xp:", "Set/correct someone's all-time starting XP"),
         ("/hide user: enabled:", "Hide/unhide a member from leaderboards — still fully tracked"),
+        ("/ignorerequirement user: enabled:", "Exempt a member (e.g. admin/mod) from being flagged as behind pace"),
         ("/fullreset user: [clear_history]", "Reset both weekly and all-time totals for one user"),
         ("/removeuser user:<@user>", "Wipe one user's tracking data"),
         ("/removeuserbyid discord_id:<id>", "Same, but by raw ID — works for departed members"),
@@ -3936,6 +3952,8 @@ async def scheduled_checks():
                 no_checkin_members = []
                 behind_pace_members = []
                 for uid, entry in guild_data["users"].items():
+                    if is_requirement_exempt(entry):
+                        continue
                     stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
                     member = guild.get_member(int(uid))
                     if not member:
@@ -5006,6 +5024,47 @@ async def hide(interaction: discord.Interaction, user: discord.Member, enabled: 
         )
     else:
         await interaction.response.send_message(f"{who} visible on leaderboards again.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="ignorerequirement",
+    description="[Admin] Exempt a member (e.g. an admin/mod) from being flagged as behind pace",
+)
+@app_commands.describe(
+    user="Member to exempt or un-exempt",
+    enabled="True to exempt from the weekly requirement, false to hold them to it again",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+@require_tracking_channel()
+async def ignorerequirement(interaction: discord.Interaction, user: discord.Member, enabled: bool):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    entry = guild_data["users"].get(str(user.id))
+    if entry is None:
+        await interaction.response.send_message(
+            f"{user.display_name} has no tracking data yet — nothing to exempt.", ephemeral=True,
+        )
+        return
+
+    entry["requirement_exempt"] = enabled
+    save_data(data)
+    await log_admin_action(
+        interaction.guild, guild_data, interaction.user,
+        "Exempted from requirement" if enabled else "Un-exempted from requirement", target=user.mention,
+    )
+
+    if enabled:
+        await interaction.response.send_message(
+            f"{user.display_name} is now exempt from the weekly requirement — never flagged as behind pace, "
+            f"and skipped by both `/pingbehindpace` and the automatic inactivity ping, even with zero checkins. "
+            f"Their real XP and progress are still tracked and shown normally everywhere — `/status`, `/profile`, "
+            f"leaderboards, crew totals, all unaffected. This is independent of `/hide` — combine both if you "
+            f"want someone exempt from pressure *and* off the leaderboards. "
+            f"Run `/ignorerequirement user:{user.mention} enabled:false` to hold them to it again.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(f"{user.display_name} is held to the weekly requirement again.", ephemeral=True)
 
 
 @bot.tree.command(name="setlift", description="Record a lift number (deadlift/bench/squat) — shown as a badge on your profile card")
@@ -6931,6 +6990,7 @@ profile_cmd.error(_channel_error)
 crewtotals.error(_channel_error)
 undo.error(_channel_error)
 hide.error(_perm_or_premium_error)
+ignorerequirement.error(_perm_or_premium_error)
 setlift.error(_channel_error)
 removeallusers.error(_perm_error)
 
