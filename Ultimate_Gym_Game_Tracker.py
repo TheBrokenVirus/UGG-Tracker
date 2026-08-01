@@ -2944,6 +2944,7 @@ HELP_CATEGORIES = [
         ("/progresschart [user]", "XP-over-time line chart for a user"),
         ("/profile [user]", "Rendered profile card — avatar, rank, border color, progress bar"),
         ("/previewtier tier:", "See what a configured banner tier would look like on your card"),
+        ("/store", "Link to the server's store, if one's set up"),
     ]),
     ("leaderboards", "Leaderboards", "🏆", "Comparing progress across the crew", [
         ("/weeklyleaderboard", "This week's XP ranking"),
@@ -2994,12 +2995,17 @@ HELP_CATEGORIES = [
         ("/removebannertier role:<@role>", "Remove a role's banner tier"),
         ("/listbannertiers", "Show all configured banner tiers"),
         ("/setbasecard mode: color1: [color2]", "Set the server's default look for everyone else"),
+        ("/setbordercolor user: color:", "Assign an individual color, outside the tier system"),
+        ("/removebordercolor user:", "Remove an individually-assigned color"),
+        ("/listbordercolors", "Show everyone's individually-assigned colors"),
     ]),
     ("admin_bloxlink", "Admin: Bloxlink / Roblox Linking", "🔗", "Resolving verified Roblox links, for automatic XP tracking", [
         ("/setbloxlinkkey api_key:", "Set this server's Bloxlink Guild API Key"),
         ("/syncbloxlink", "Resolve links for everyone already Bloxlink-verified"),
         ("/setbloxlinkrole role:<@role>", "Auto-assign a role to anyone /syncbloxlink links"),
         ("/clearbloxlinkrole", "Stop auto-assigning a verified role"),
+        ("/generatetrackingkey", "Generate this server's key for the Roblox XP-tracking API"),
+        ("/revoketrackingkey", "Immediately disable the Roblox XP-tracking API for this server"),
     ]),
     ("admin_skus", "Admin: SKU Role Automation", "🛒", "Auto-granting roles for Discord purchases/subscriptions", [
         ("/addskurole sku_id: role: name:", "Auto-grant a role while a SKU entitlement is active"),
@@ -3012,6 +3018,12 @@ HELP_CATEGORIES = [
         ("/removepremiumguild [guild_id]", "Remove a server's free premium exemption"),
         ("/listpremiumguilds", "Show every server with premium, free or paid"),
         ("/listservers", "List every server this bot is currently in"),
+    ]),
+    ("owner_store", "Owner: Store", "🛍️", "Configuring the /store link and its listed products", [
+        ("/setstoreurl url:", "Set the store link /store points to"),
+        ("/clearstoreurl", "Remove the store link"),
+        ("/addproduct name: price: [description] [emoji]", "Add a product listing to /store"),
+        ("/removeproduct name:", "Remove a product listing"),
     ]),
     ("admin_display", "Admin: Display", "🎨", "How leaderboards and status look", [
         ("/togglerecentrate enabled:", "Show/hide the \"Recent Rate\" field"),
@@ -3031,6 +3043,8 @@ HELP_CATEGORIES = [
         ("/setinactivitythreshold days: hours: minutes:", "How early the inactivity ping fires"),
         ("/toggleinactivitybehindpace enabled:", "Also flag people behind pace, not just zero-checkins"),
         ("/pingbehindpace", "Immediately ping everyone checked in but behind pace, right now"),
+        ("/setadminlogchannel channel:<#channel>", "Log destructive/config-changing admin actions"),
+        ("/clearadminlogchannel", "Turn off the admin action log"),
     ]),
 ]
 
@@ -7314,6 +7328,7 @@ history.error(_channel_error)
 progresschart.error(_channel_error)
 profile_cmd.error(_channel_error)
 crewtotals.error(_channel_error)
+crewlevel_cmd.error(_channel_error)
 undo.error(_channel_error)
 hide.error(_perm_or_premium_error)
 ignorerequirement.error(_perm_or_premium_error)
