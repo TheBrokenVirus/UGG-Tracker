@@ -159,7 +159,7 @@ def default_guild_data() -> dict:
         "compact_leaderboard": False,
         "prorate_threshold_hours": DEFAULT_PRORATE_THRESHOLD_HOURS,
         "xp_roles": [],
-        "restricted_channel_id": None,
+        "allowed_channel_ids": [],
         "announce_channel_id": None,
         "weekly_post_channel_id": None,
         "last_weekly_post_marker": None,
@@ -271,9 +271,17 @@ def require_premium():
         )
     return app_commands.check(predicate)
 
-def get_restricted_channel_id(guild_data: dict) -> Optional[int]:
-    """Backward-compatible getter — older guild entries won't have this key."""
-    return guild_data.get("restricted_channel_id")
+def get_allowed_channel_ids(guild_data: dict) -> list:
+    """Backward-compatible getter — servers set up before multi-channel
+    support used a single restricted_channel_id instead of a list. If the
+    new list field isn't present but that old field is, the existing
+    restriction carries over as a one-item list rather than silently
+    getting dropped on upgrade. An empty list means unrestricted, same
+    meaning as the old field being None."""
+    if "allowed_channel_ids" in guild_data:
+        return guild_data["allowed_channel_ids"]
+    old_id = guild_data.get("restricted_channel_id")
+    return [old_id] if old_id else []
 
 def get_admin_log_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
@@ -308,16 +316,18 @@ def leaderboard_pagination_enabled(guild_data: dict) -> bool:
     return guild_data.get("leaderboard_pagination", False)
 
 def require_tracking_channel():
-    """Command decorator: if the server has designated a channel with
-    /setchannel, restricts the command to that channel only. If no
-    channel is set, every channel is allowed (no behavior change)."""
+    """Command decorator: if the server has designated one or more
+    channels with /addallowedchannel, restricts the command to those
+    channels only. If none are set, every channel is allowed (no
+    behavior change)."""
     async def predicate(interaction: discord.Interaction) -> bool:
         data = load_data()
         guild_data = get_guild(data, interaction.guild_id)
-        channel_id = get_restricted_channel_id(guild_data)
-        if channel_id is None or interaction.channel_id == channel_id:
+        allowed = get_allowed_channel_ids(guild_data)
+        if not allowed or interaction.channel_id in allowed:
             return True
-        raise app_commands.CheckFailure(f"This command can only be used in <#{channel_id}>.")
+        mentions = ", ".join(f"<#{cid}>" for cid in allowed)
+        raise app_commands.CheckFailure(f"This command can only be used in: {mentions}")
     return app_commands.check(predicate)
 
 def show_recent_rate_enabled(guild_data: dict) -> bool:
@@ -1205,10 +1215,10 @@ def build_settings_embed(guild_data: dict) -> discord.Embed:
     embed.add_field(name="Prorate Threshold", value=threshold_str, inline=True)
     embed.add_field(name="XP Milestone Roles", value=str(len(get_xp_roles(guild_data))), inline=True)
 
-    restricted = get_restricted_channel_id(guild_data)
+    allowed_channels = get_allowed_channel_ids(guild_data)
     embed.add_field(
-        name="Tracking Channel",
-        value=f"<#{restricted}>" if restricted else "Any channel (unrestricted)",
+        name="Tracking Channels",
+        value=", ".join(f"<#{cid}>" for cid in allowed_channels) if allowed_channels else "Any channel (unrestricted)",
         inline=True,
     )
     announce = get_announce_channel_id(guild_data)
@@ -2287,23 +2297,49 @@ class RemoveXPRoleSelectView(discord.ui.View):
             await interaction.response.send_message("That role wasn't configured as an XP milestone.", ephemeral=True)
 
 
-class SetTrackingChannelView(discord.ui.View):
+class AddTrackingChannelView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=120)
         self.guild_id = guild_id
 
     @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text],
-                        placeholder="Choose the channel for /checkin, /status, and leaderboards")
+                        placeholder="Choose a channel to allow /checkin, /status, and leaderboards in")
     async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         channel = select.values[0]
         data = load_data()
         guild_data = get_guild(data, self.guild_id)
-        guild_data["restricted_channel_id"] = channel.id
+        allowed = guild_data.setdefault("allowed_channel_ids", get_allowed_channel_ids(guild_data))
+        if channel.id in allowed:
+            await interaction.response.send_message(f"{channel.mention} is already an allowed channel.", ephemeral=True)
+            return
+        allowed.append(channel.id)
         save_data(data)
         await interaction.response.send_message(
-            f"Tracking commands are now restricted to {channel.mention}. Use `/clearchannel` to remove this restriction.",
+            f"{channel.mention} added — tracking commands now work there too. "
+            f"({len(allowed)} allowed channel(s) total; other channels remain off-limits.)",
             ephemeral=True,
         )
+
+
+class RemoveTrackingChannelView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=[discord.ChannelType.text],
+                        placeholder="Choose a channel to remove from the allowed list")
+    async def select_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        channel = select.values[0]
+        data = load_data()
+        guild_data = get_guild(data, self.guild_id)
+        allowed = guild_data.setdefault("allowed_channel_ids", get_allowed_channel_ids(guild_data))
+        if channel.id not in allowed:
+            await interaction.response.send_message(f"{channel.mention} wasn't in the allowed list.", ephemeral=True)
+            return
+        allowed.remove(channel.id)
+        save_data(data)
+        note = " No channels are allow-listed now, so tracking commands work anywhere again." if not allowed else ""
+        await interaction.response.send_message(f"{channel.mention} removed from the allowed list.{note}", ephemeral=True)
 
 
 class SetAnnounceChannelView(discord.ui.View):
@@ -3032,8 +3068,10 @@ HELP_CATEGORIES = [
         ("/toggleanimatedprofile enabled:", "Animated color-cycling /profile card vs. a static image"),
     ]),
     ("admin_automation", "Admin: Channels & Automation", "📢", "Restrictions, announcements, schedules, pings", [
-        ("/setchannel channel:<#channel>", "Restrict tracking commands to one channel"),
-        ("/clearchannel", "Remove the channel restriction"),
+        ("/addallowedchannel channel:<#channel>", "Allow tracking commands in another channel"),
+        ("/removeallowedchannel channel:<#channel>", "Stop allowing tracking commands in a channel"),
+        ("/listallowedchannels", "Show every currently-allowed channel"),
+        ("/clearallowedchannels", "Remove all channel restrictions"),
         ("/setannouncechannel channel:<#channel>", "Public posts when someone earns a role"),
         ("/clearannouncechannel", "Turn off milestone announcements"),
         ("/setweeklypost channel:<#channel>", "Auto-post the leaderboard before each week ends"),
@@ -3584,10 +3622,15 @@ class AutomationSettingsView(discord.ui.View):
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await go_settings_home(interaction, self.guild_id)
 
-    @discord.ui.button(label="Tracking Channel", style=discord.ButtonStyle.primary, emoji="📌", row=0)
-    async def set_tracking_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = SetTrackingChannelView(self.guild_id)
-        await interaction.response.send_message("Select a channel:", view=view, ephemeral=True)
+    @discord.ui.button(label="+ Tracking Channel", style=discord.ButtonStyle.primary, emoji="📌", row=0)
+    async def add_tracking_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = AddTrackingChannelView(self.guild_id)
+        await interaction.response.send_message("Select a channel to allow:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="− Tracking Channel", style=discord.ButtonStyle.secondary, emoji="📌", row=0)
+    async def remove_tracking_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = RemoveTrackingChannelView(self.guild_id)
+        await interaction.response.send_message("Select a channel to remove:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Announce Channel", style=discord.ButtonStyle.primary, emoji="📢", row=0)
     async def set_announce_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -5565,27 +5608,67 @@ async def togglecompactleaderboard(interaction: discord.Interaction, enabled: bo
     )
 
 
-@bot.tree.command(name="setchannel", description="[Admin] Restrict tracking commands to a single channel")
-@app_commands.describe(channel="Channel where /checkin, /status, and leaderboards will be allowed")
+@bot.tree.command(name="addallowedchannel", description="[Admin] Allow tracking commands in another channel")
+@app_commands.describe(channel="Channel to allow /checkin, /status, and leaderboards in")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+async def addallowedchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
-    guild_data["restricted_channel_id"] = channel.id
+    allowed = guild_data.setdefault("allowed_channel_ids", get_allowed_channel_ids(guild_data))
+    if channel.id in allowed:
+        await interaction.response.send_message(f"{channel.mention} is already an allowed channel.", ephemeral=True)
+        return
+    allowed.append(channel.id)
     save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Added allowed channel", target=channel.mention)
     await interaction.response.send_message(
         f"Tracking commands (`/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, "
-        f"`/undo`) are now restricted to {channel.mention}. Admin/config commands still work anywhere."
+        f"`/undo`) now work in {channel.mention} too. "
+        f"({len(allowed)} allowed channel(s) total — any channel not on this list still isn't permitted; "
+        f"admin/config commands work everywhere regardless.)"
     )
 
 
-@bot.tree.command(name="clearchannel", description="[Admin] Remove the channel restriction — allow tracking commands anywhere")
+@bot.tree.command(name="removeallowedchannel", description="[Admin] Stop allowing tracking commands in a channel")
+@app_commands.describe(channel="Channel to remove from the allowed list")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def clearchannel(interaction: discord.Interaction):
+async def removeallowedchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     data = load_data()
     guild_data = get_guild(data, interaction.guild_id)
-    guild_data["restricted_channel_id"] = None
+    allowed = guild_data.setdefault("allowed_channel_ids", get_allowed_channel_ids(guild_data))
+    if channel.id not in allowed:
+        await interaction.response.send_message(f"{channel.mention} wasn't in the allowed list.", ephemeral=True)
+        return
+    allowed.remove(channel.id)
     save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Removed allowed channel", target=channel.mention)
+    note = " No channels are allow-listed now, so tracking commands work anywhere again." if not allowed else ""
+    await interaction.response.send_message(f"{channel.mention} removed from the allowed list.{note}")
+
+
+@bot.tree.command(name="listallowedchannels", description="[Admin] Show every channel tracking commands are currently allowed in")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def listallowedchannels(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    allowed = get_allowed_channel_ids(guild_data)
+    if not allowed:
+        await interaction.response.send_message(
+            "No channel restriction is set — tracking commands work in any channel.", ephemeral=True,
+        )
+        return
+    mentions = "\n".join(f"• <#{cid}>" for cid in allowed)
+    await interaction.response.send_message(f"**Allowed channels ({len(allowed)}):**\n{mentions}", ephemeral=True)
+
+
+@bot.tree.command(name="clearallowedchannels", description="[Admin] Remove all channel restrictions — allow tracking commands anywhere")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clearallowedchannels(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["allowed_channel_ids"] = []
+    save_data(data)
+    await log_admin_action(interaction.guild, guild_data, interaction.user, "Cleared all allowed-channel restrictions")
     await interaction.response.send_message("Channel restriction removed — tracking commands now work in any channel.")
 
 
@@ -7259,8 +7342,10 @@ async def _perm_or_premium_error(interaction: discord.Interaction, error: app_co
         raise error
 
 setrequirement.error(_perm_error)
-setchannel.error(_perm_error)
-clearchannel.error(_perm_error)
+addallowedchannel.error(_perm_error)
+removeallowedchannel.error(_perm_error)
+listallowedchannels.error(_perm_error)
+clearallowedchannels.error(_perm_error)
 setannouncechannel.error(_perm_or_premium_error)
 clearannouncechannel.error(_perm_or_premium_error)
 setweeklypost.error(_perm_error)

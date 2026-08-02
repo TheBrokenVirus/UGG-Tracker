@@ -126,8 +126,10 @@ weekly requirement (default: 20,000 XP/week).
 | `/analytics` | Admin ⭐ | Server-wide activity: retention week-over-week, most active day, top gainer, average gain. See below. |
 | `/setadminlogchannel channel:<#channel>` | Admin | Log destructive/data-altering admin actions to a channel. See below. |
 | `/clearadminlogchannel` | Admin | Turn off admin action logging. |
-| `/setchannel channel:<#channel>` | Admin | Restrict `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` to one channel. Admin/config commands still work anywhere. |
-| `/clearchannel` | Admin | Remove the channel restriction. |
+| `/addallowedchannel channel:<#channel>` | Admin | Allow `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` in another channel. First one added starts restricting; before that, every channel works. |
+| `/removeallowedchannel channel:<#channel>` | Admin | Remove a channel from the allowed list. |
+| `/listallowedchannels` | Admin | Show every currently-allowed channel. |
+| `/clearallowedchannels` | Admin | Remove all channel restrictions — tracking commands work anywhere again. |
 | `/setannouncechannel channel:<#channel>` | Admin ⭐ | Post a public congratulations message whenever someone earns an XP milestone role. |
 | `/clearannouncechannel` | Admin ⭐ | Turn off milestone announcements. |
 | `/setweeklypost channel:<#channel>` | Admin | Auto-post the weekly leaderboard shortly before each week ends. Requires a shared server week. |
@@ -181,7 +183,7 @@ Running `/settings` opens an interactive panel (admins only) instead of typing o
 - **List Tiers** — shows every configured tier, its role, mode, and colors (same as `/listbannertiers`)
 
 **📢 Channels & Automation**
-- **Tracking Channel** — restrict tracking commands to one channel (same as `/setchannel`)
+- **Tracking Channels** — add/remove which channels tracking commands are allowed in (same as `/addallowedchannel`/`/removeallowedchannel`)
 - **Announce Channel** — where milestone role announcements post (same as `/setannouncechannel`)
 - **Weekly Post Channel** — where the auto-posted weekly leaderboard goes (same as `/setweeklypost`)
 - **Inactivity Channel** — where inactivity reminder pings post (same as `/setinactivitychannel`)
@@ -316,17 +318,19 @@ On `/weeklyleaderboard`, this only shows a single shared range if your server us
 
 `/status` also shows a text progress bar (e.g. `████████░░░░░░ 57%`) tracking gained-this-week against the requirement — the prorated amount, for anyone in a prorated first week, rather than the flat full number.
 
-## Restricting commands to one channel
+## Restricting commands to specific channels
 
-By default every command works in any channel. If you'd rather keep XP tracking confined to a dedicated channel (e.g. `#xp-tracking`) instead of cluttering general chat:
+By default every command works in any channel. If you'd rather keep XP tracking confined to one or more dedicated channels (e.g. `#xp-tracking`) instead of cluttering general chat:
 
 ```
-/setchannel channel:#xp-tracking
+/addallowedchannel channel:#xp-tracking
 ```
 
-This restricts `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` — the commands people use often — to that one channel. Trying to run them elsewhere gets a clear message pointing to the right channel instead of silently failing.
+The first channel you add is what starts the restriction — before that, every channel works normally. Add more with the same command to allow several channels at once (e.g. one per team, or a general channel plus an overflow channel). This restricts `/checkin`, `/status`, `/weeklyleaderboard`, `/totalleaderboard`, `/history`, `/undo`, and `/progresschart` — the commands people use often — to whichever channels are on the list. Trying to run them elsewhere gets a clear message listing which channels are actually allowed, instead of silently failing.
 
-**Admin/config commands are deliberately exempt** — `/settings`, `/addxprole`, `/setrequirement`, and so on still work in any channel, since admins often manage settings from a separate admin-only channel. Run `/clearchannel` to remove the restriction entirely.
+`/removeallowedchannel` takes one channel back off the list. `/listallowedchannels` shows the current list. `/clearallowedchannels` wipes the whole restriction, back to "works anywhere."
+
+**Admin/config commands are deliberately exempt** — `/settings`, `/addxprole`, `/setrequirement`, and so on still work in any channel, since admins often manage settings from a separate admin-only channel.
 
 ## Exporting data
 
