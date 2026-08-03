@@ -160,6 +160,7 @@ def default_guild_data() -> dict:
         "prorate_threshold_hours": DEFAULT_PRORATE_THRESHOLD_HOURS,
         "xp_roles": [],
         "allowed_channel_ids": [],
+        "leaderboard_history": [],
         "announce_channel_id": None,
         "weekly_post_channel_id": None,
         "last_weekly_post_marker": None,
@@ -2986,6 +2987,7 @@ HELP_CATEGORIES = [
         ("/weeklyleaderboard", "This week's XP ranking"),
         ("/totalleaderboard", "All-time total XP ranking (includes starting point)"),
         ("/crewtotals", "Combined crew-wide totals, including departed members"),
+        ("/pastleaderboard [weeks_ago]", "A previous week's leaderboard — 1 = most recently finished"),
         ("/crewlevel", "Crew's in-game level, progress, and ETA to the next one"),
         ("/listxproles", "Show configured XP milestone roles"),
     ]),
@@ -4069,6 +4071,17 @@ async def scheduled_checks():
         time_until_end = week_end - now
         week_marker = iso(week_start)
 
+        # --- Weekly leaderboard snapshot (independent of the public post above —
+        # keeping an internal record doesn't require wanting a public announcement) ---
+        if (
+            timedelta(0) < time_until_end <= WEEKLY_POST_WINDOW
+            and guild_data.get("last_snapshot_marker") != week_marker
+        ):
+            history = guild_data.setdefault("leaderboard_history", [])
+            history.append(snapshot_weekly_leaderboard(guild, guild_data))
+            guild_data["last_snapshot_marker"] = week_marker
+            changed = True
+
         # --- Scheduled weekly post ---
         post_channel_id = get_weekly_post_channel_id(guild_data)
         if (
@@ -4470,6 +4483,42 @@ async def status(interaction: discord.Interaction, user: Optional[discord.Member
     await interaction.response.send_message(embed=embed)
 
 
+def snapshot_weekly_leaderboard(guild: discord.Guild, guild_data: dict) -> dict:
+    """Captures a full, structured record of the current weekly
+    leaderboard — the same underlying per-member data
+    build_weekly_leaderboard_lines uses for the live display, just
+    stored as structured records instead of rendered text, so it can be
+    redisplayed flexibly later rather than replaying a frozen string.
+    Called once per guild right before each shared week rolls over (see
+    scheduled_checks) — /pastleaderboard browses these indefinitely."""
+    rows = []
+    for uid, entry in guild_data["users"].items():
+        if is_hidden_from_leaderboard(entry):
+            continue
+        stats = compute_stats(entry, guild_data["requirement"], get_prorate_threshold_hours(guild_data))
+        member = guild.get_member(int(uid))
+        name = member.display_name if member else f"Unknown ({uid})"
+        rows.append({
+            "discord_id": uid,
+            "name": name,
+            "gained": stats["gained_this_week"],
+            "current_xp": entry["current_xp"],
+            "on_track": stats["on_track"],
+            "is_prorated": stats["is_prorated"],
+            "checkins_this_week": stats["checkins_this_week"],
+            "projected_total": round(stats["projected_total"]),
+        })
+    rows.sort(key=lambda r: r["gained"], reverse=True)
+
+    anchor = guild_data.get("week_anchor")
+    week_start = parse_iso(anchor) if anchor else utcnow()
+    return {
+        "week_start": iso(week_start),
+        "week_end": iso(utcnow()),
+        "requirement": guild_data["requirement"],
+        "entries": rows,
+    }
+
 def build_weekly_leaderboard_lines(guild: discord.Guild, guild_data: dict) -> tuple:
     """Returns (lines, extra_field, footer) for the weekly leaderboard.
     Shared between the /weeklyleaderboard command and the scheduled
@@ -4647,6 +4696,49 @@ async def crewtotals(interaction: discord.Interaction):
     if adjustment:
         footer += f" Includes a manual adjustment of {adjustment:+,} XP (see /adjustcrewxp)."
     embed.set_footer(text=footer)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="pastleaderboard", description="Show a past week's leaderboard — how many weeks ago, defaults to the most recent")
+@app_commands.describe(weeks_ago="How many completed weeks back — 1 = the most recently finished week (default)")
+@require_tracking_channel()
+async def pastleaderboard(interaction: discord.Interaction, weeks_ago: int = 1):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    history = guild_data.get("leaderboard_history", [])
+
+    if not history:
+        await interaction.response.send_message(
+            "No leaderboard history yet. Snapshots are only taken automatically once a shared week is set up "
+            "(`/setweekprogressall`), and only once at least one full week has completed since — check back "
+            "after the current week ends."
+        )
+        return
+    if weeks_ago < 1 or weeks_ago > len(history):
+        await interaction.response.send_message(
+            f"Only {len(history)} past week(s) recorded — try a number from 1 to {len(history)}.", ephemeral=True,
+        )
+        return
+
+    snapshot = history[-weeks_ago]  # history is oldest-first; -1 = most recently completed week
+    lines = []
+    for i, row in enumerate(snapshot["entries"], start=1):
+        icon = "✅" if row["on_track"] else "⚠️"
+        prorated = " 🆕" if row.get("is_prorated") else ""
+        lines.append(f"{i}. **{row['name']}** — {row['gained']:,} XP {icon}{prorated}")
+    description = join_leaderboard_lines(lines) if lines else "No one was tracked that week."
+
+    week_start = parse_iso(snapshot["week_start"])
+    week_end = parse_iso(snapshot["week_end"])
+    embed = discord.Embed(
+        title=f"📊 Weekly Leaderboard — {week_range_str(week_start)}",
+        description=description,
+        color=discord.Color.dark_gold(),
+    )
+    embed.set_footer(
+        text=f"{weeks_ago} week(s) ago · Requirement was {snapshot['requirement']:,} XP · "
+             f"Snapshot taken {format_timedelta(utcnow() - week_end)} ago"
+    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -7413,6 +7505,7 @@ history.error(_channel_error)
 progresschart.error(_channel_error)
 profile_cmd.error(_channel_error)
 crewtotals.error(_channel_error)
+pastleaderboard.error(_channel_error)
 crewlevel_cmd.error(_channel_error)
 undo.error(_channel_error)
 hide.error(_perm_or_premium_error)

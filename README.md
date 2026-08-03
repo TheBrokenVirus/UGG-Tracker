@@ -77,6 +77,7 @@ weekly requirement (default: 20,000 XP/week).
 | `/weeklyleaderboard` | Everyone | Ranked list of everyone's XP gained *this week*, with on-track indicators. |
 | `/totalleaderboard` | Everyone | Ranked by each person's *actual total XP* (starting point + everything gained since), not just the gain alone. |
 | `/crewtotals` | Everyone | The whole crew's combined XP added together — total XP and this week's gain, summed across everyone tracked (including anyone no longer in the server). |
+| `/pastleaderboard [weeks_ago]` | Everyone | A previous week's full leaderboard — `1` (default) is the most recently finished week, higher numbers go further back. See "Leaderboard history" below. |
 | `/crewlevel` | Everyone | The crew's in-game level (an exponential formula, see below), progress to the next one, and an ETA based on the crew's combined recent pace. |
 | `/setcrewlevelformula base_xp: growth_rate:` | Admin | Sets the level-1→2 XP cost and the per-level growth rate `/crewlevel` uses. See "Crew level" below. |
 | `/adjustcrewxp amount:` | Admin | Manually adds (or subtracts, with a negative number) from the crew's combined XP total used by `/crewtotals` and `/crewlevel`. See "Crew level" below. |
@@ -580,6 +581,20 @@ With this on, the ping message splits into two clearly labeled groups — "haven
 **Don't want to wait for the scheduled ping?** `/pingbehindpace` does the "behind pace" half of this on demand, right now, regardless of `/toggleinactivitybehindpace`'s setting or how close the week is to ending — useful for a mid-week nudge rather than only at the automatic threshold. It only ever pings people who've checked in but aren't on track; it doesn't touch the "zero checkins" group, which stays exclusive to the automatic ping.
 
 Run `/clearinactivitychannel` to turn pings off entirely.
+
+## Leaderboard history
+
+```
+/pastleaderboard weeks_ago:2
+```
+
+Every week's final leaderboard is automatically saved, indefinitely — full detail, same data the live leaderboard shows (rank, gain, on-track status, prorated flag), not just a summary. `/pastleaderboard` browses it: `1` (the default) is the most recently completed week, `2` is the week before that, and so on back through everything that's ever been recorded.
+
+**Requires a shared week to work at all.** A snapshot is taken automatically, once, right before each week boundary — but "the week" only has one clear ending moment for the whole crew if `/setweekprogressall` has established a shared clock (`week_anchor`). Without that, different members' weeks end at different times, and there's no single "the leaderboard for week N" to save. If your crew has never used a shared week, `/pastleaderboard` will have nothing to show until that's set up and at least one full week completes under it.
+
+**Independent of `/setweeklypost`.** That feature announces the leaderboard publicly to a channel; this one just remembers it internally. You can have history without ever setting up the public post, or the public post without necessarily thinking about history — they happen to share the same trigger moment, but one doesn't require the other.
+
+**Worth knowing about growth:** since this keeps every week forever by design, the data file does grow a little each week — roughly proportional to server size (a snapshot is a small record per tracked member). For a typical crew this adds up to single-digit megabytes over a couple of years, not a practical concern, but it's not nothing either, and it's not something this bot currently prunes or caps automatically. If that ever becomes worth revisiting, that's a real conversation to have deliberately rather than something to assume away.
 
 ## Leaderboard pagination
 
