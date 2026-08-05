@@ -7571,12 +7571,14 @@ async def handle_roblox_checkin(request: web.Request) -> web.Response:
     if xp < 0:
         return web.json_response({"error": "xp cannot be negative"}, status=400)
     if xp > MAX_API_CHECKIN_XP:
-        # A valid key doesn't mean a valid NUMBER — this catches a bug on
-        # the game's own end (a miscalculation, a bad multiplier, garbage
-        # data) from silently becoming someone's real recorded XP.
-        # Deliberately generous, not a real rate cap (that's what
-        # /setxpratecap is for, and it doesn't apply here on purpose —
-        # see below) — just a ceiling against an obviously-wrong number.
+        # A valid key and a passing rate-cap check don't mean a valid
+        # NUMBER — this catches a single-request outlier (a bug, a bad
+        # multiplier, garbage data) that could otherwise slip through if
+        # it happened to be someone's very first checkin (no prior value
+        # to compare a rate against) or if no rate cap is configured at
+        # all for this server. Deliberately generous — a hard ceiling
+        # against an obviously-wrong number, not a substitute for the
+        # rate cap above.
         return web.json_response(
             {"error": f"xp exceeds the sanity ceiling ({MAX_API_CHECKIN_XP:,}) — rejected, nothing recorded"},
             status=400,
@@ -7595,14 +7597,34 @@ async def handle_roblox_checkin(request: web.Request) -> web.Response:
             status=404,
         )
 
-    # No rate-cap check here, deliberately — the XP rate cap (/setxpratecap)
-    # exists to catch a human typing an inflated number into /checkin. Data
-    # arriving through this API comes from the game's own server-side
-    # state, a fundamentally different trust level, same reasoning as why
-    # an admin manually running /checkin on someone else's behalf already
-    # bypasses the cap. The sanity ceiling above is a separate, much
-    # coarser safeguard against a bug rather than dishonesty.
+    # Rate cap DOES apply here — same check /checkin's self-report path
+    # uses, same config (/setxpratecap). This endpoint was originally
+    # built exempting it, on the assumption that only server-authoritative
+    # game data (something a player genuinely can't influence) would ever
+    # call it. That assumption doesn't hold for every real integration —
+    # a client-side, screen-scraped submission is functionally the same
+    # trust level as a human typing a number into /checkin, just automated,
+    # and there's currently no way for this endpoint to tell those apart
+    # from genuine server-side data. Applied unconditionally: there's no
+    # "trusted admin" concept for an API caller the way there is for a
+    # Discord command, every request here is equally the input source.
     entry = guild_data["users"].get(discord_id)
+    max_rate = get_max_checkin_rate(guild_data)
+    if max_rate and entry and entry["checkins"]:
+        last_checkin = entry["checkins"][-1]
+        rate_gain = xp - last_checkin["xp"]
+        if rate_gain > 0:
+            rate_hours = max((utcnow() - parse_iso(last_checkin["time"])).total_seconds() / 3600, 1 / 3600)
+            implied_rate = rate_gain / rate_hours
+            if implied_rate > max_rate:
+                return web.json_response(
+                    {
+                        "error": f"implied rate {implied_rate:,.0f} XP/hr exceeds this server's cap of "
+                                 f"{max_rate:,.0f} XP/hr — rejected, nothing recorded",
+                    },
+                    status=400,
+                )
+
     if entry is None:
         entry = create_user(guild_data, int(discord_id), xp, source="roblox_api")
     else:
@@ -7634,8 +7656,9 @@ async def start_api_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
     print(
-        f"⚠️  Roblox API listening on 0.0.0.0:{port} — NO AUTHENTICATION IS CONFIGURED. This is a known, "
-        f"temporary, insecure state. Do not point the real game at this or expose it publicly yet."
+        f"Roblox API listening on 0.0.0.0:{port}. Requests require a valid per-server key (see "
+        f"/generatetrackingkey) — anything without one, or with a wrong one, is rejected before it can "
+        f"touch any data. A server with no key generated yet simply can't be reached through this API at all."
     )
 
 
