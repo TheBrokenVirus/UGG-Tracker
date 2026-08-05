@@ -189,6 +189,7 @@ def default_guild_data() -> dict:
         "bloxlink_api_key": None,
         "bloxlink_verified_role_id": None,
         "tracking_api_key": None,
+        "autotrack_channel_id": None,
     }
 
 def get_guild(data: dict, guild_id: int) -> dict:
@@ -303,6 +304,10 @@ def inactivity_includes_behind_pace(guild_data: dict) -> bool:
 def get_announce_channel_id(guild_data: dict) -> Optional[int]:
     """Backward-compatible getter — older guild entries won't have this key."""
     return guild_data.get("announce_channel_id")
+
+def get_autotrack_channel_id(guild_data: dict) -> Optional[int]:
+    """Backward-compatible getter — older guild entries won't have this key."""
+    return guild_data.get("autotrack_channel_id")
 
 def get_weekly_post_channel_id(guild_data: dict) -> Optional[int]:
     return guild_data.get("weekly_post_channel_id")
@@ -453,6 +458,37 @@ async def announce_role_milestone(guild: discord.Guild, guild_data: dict, member
         title="🎉 Milestone Reached!",
         description=f"{member.mention} just earned {role_names}!",
         color=discord.Color.gold(),
+    )
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+async def announce_autotrack_update(
+    guild: discord.Guild, guild_data: dict, member: discord.Member,
+    current_xp: int, previous_xp: Optional[int],
+):
+    """Posts a message when the Roblox auto-tracking API (see
+    handle_roblox_checkin) updates someone's XP, if a channel has been
+    configured via /setautotrackchannel. Deliberately separate from
+    /checkin's manual updates and from announce_role_milestone — this
+    fires on every automatic update regardless of whether a role was
+    earned, so admins can watch the automatic feed on its own."""
+    channel_id = get_autotrack_channel_id(guild_data)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    gained = current_xp - previous_xp if previous_xp is not None else None
+    description = f"{member.mention} is now at **{current_xp:,} XP**"
+    if gained is not None and gained > 0:
+        description += f" (+{gained:,})"
+    embed = discord.Embed(
+        title="🔄 Auto-Tracked XP Update",
+        description=description,
+        color=discord.Color.blurple(),
     )
     try:
         await channel.send(embed=embed)
@@ -3085,6 +3121,8 @@ HELP_CATEGORIES = [
         ("/pingbehindpace", "Immediately ping everyone checked in but behind pace, right now"),
         ("/setadminlogchannel channel:<#channel>", "Log destructive/config-changing admin actions"),
         ("/clearadminlogchannel", "Turn off the admin action log"),
+        ("/setautotrackchannel channel:<#channel>", "Post a message whenever the Roblox auto-tracking API updates someone's XP"),
+        ("/clearautotrackchannel", "Turn off auto-tracked XP update messages"),
     ]),
 ]
 
@@ -5879,6 +5917,30 @@ async def clearadminlogchannel(interaction: discord.Interaction):
     await interaction.response.send_message("Admin action logging is now off.")
 
 
+@bot.tree.command(name="setautotrackchannel", description="[Admin] Post a message whenever the Roblox auto-tracking API updates someone's XP")
+@app_commands.describe(channel="Channel where auto-tracked XP updates will be posted")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setautotrackchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["autotrack_channel_id"] = channel.id
+    save_data(data)
+    await interaction.response.send_message(
+        f"Auto-tracked XP updates (from the Roblox tracking API — see /generatetrackingkey) will now be "
+        f"posted in {channel.mention}. Manual `/checkin` submissions won't trigger this."
+    )
+
+
+@bot.tree.command(name="clearautotrackchannel", description="[Admin] Turn off auto-tracked XP update messages")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clearautotrackchannel(interaction: discord.Interaction):
+    data = load_data()
+    guild_data = get_guild(data, interaction.guild_id)
+    guild_data["autotrack_channel_id"] = None
+    save_data(data)
+    await interaction.response.send_message("Auto-tracked XP update messages are now off.")
+
+
 @bot.tree.command(name="setstoreurl", description="[Owner] Set the link shown by /store's Visit Store button")
 @app_commands.describe(url="Full URL to your store — must start with http:// or https://")
 @is_bot_owner()
@@ -7449,6 +7511,8 @@ setinactivitychannel.error(_perm_or_premium_error)
 clearinactivitychannel.error(_perm_or_premium_error)
 setadminlogchannel.error(_perm_error)
 clearadminlogchannel.error(_perm_error)
+setautotrackchannel.error(_perm_error)
+clearautotrackchannel.error(_perm_error)
 setstoreurl.error(_channel_error)
 clearstoreurl.error(_channel_error)
 addproduct.error(_channel_error)
@@ -7625,6 +7689,7 @@ async def handle_roblox_checkin(request: web.Request) -> web.Response:
                     status=400,
                 )
 
+    previous_xp = entry["current_xp"] if entry is not None else None
     if entry is None:
         entry = create_user(guild_data, int(discord_id), xp, source="roblox_api")
     else:
@@ -7635,6 +7700,7 @@ async def handle_roblox_checkin(request: web.Request) -> web.Response:
     member = guild.get_member(int(discord_id))
     if member is not None:
         role_result = await apply_xp_roles(guild, member, guild_data, entry["current_xp"])
+        await announce_autotrack_update(guild, guild_data, member, entry["current_xp"], previous_xp)
 
     return web.json_response({
         "status": "ok",
