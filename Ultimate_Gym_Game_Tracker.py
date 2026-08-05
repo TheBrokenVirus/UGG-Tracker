@@ -7695,6 +7695,18 @@ async def handle_roblox_checkin(request: web.Request) -> web.Response:
     else:
         record_checkin(entry, xp, source="roblox_api")
     save_data(data)
+    # Diagnostic: an autotracked checkin has been reported as "succeeding"
+    # (200 response) but not showing up in /status for the expected user.
+    # The update/save logic here looks correct in isolation, so the likely
+    # explanation is roblox_user_id resolving to a discord_id that ISN'T the
+    # Discord account someone expects it to be (a stale/wrong Bloxlink link,
+    # or the caller resolved a different Roblox account than intended). This
+    # print (visible in the bot's console/host logs) makes that undeniable
+    # on the next test instead of guessing further.
+    print(
+        f"[roblox_checkin] guild={guild_id_int} roblox_user_id={roblox_user_id} "
+        f"-> discord_id={discord_id} previous_xp={previous_xp} new_xp={entry['current_xp']}"
+    )
 
     role_result = {"added": [], "removed": []}
     member = guild.get_member(int(discord_id))
